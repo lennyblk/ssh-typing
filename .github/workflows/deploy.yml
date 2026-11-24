@@ -43,8 +43,15 @@ jobs:
           (umask 077; printf '%s\n' "$DEPLOY_KEY" > ~/.ssh/deploy)
           printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > ~/.ssh/known_hosts
       # La clé est limitée côté serveur à deploy.sh : aucune commande à envoyer.
+      # Sans la commande forcée, ssh ouvrirait un shell vide et sortirait en succès :
+      # on exige donc la ligne de confirmation de deploy.sh.
       - name: Déployer
-        run: >
-          ssh -T -i ~/.ssh/deploy -o IdentitiesOnly=yes -o BatchMode=yes
-          -o StrictHostKeyChecking=yes -o ServerAliveInterval=30
-          root@lennyblk.dev </dev/null
+        shell: bash
+        run: |
+          ssh -T -i ~/.ssh/deploy -o IdentitiesOnly=yes -o BatchMode=yes \
+            -o StrictHostKeyChecking=yes -o ServerAliveInterval=30 \
+            root@lennyblk.dev </dev/null | tee deploy.log
+          grep -q '^déployé : ' deploy.log || {
+            echo "::error::deploy.sh n'a pas tourné : vérifier command= dans authorized_keys"
+            exit 1
+          }
