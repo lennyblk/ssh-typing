@@ -14,7 +14,7 @@ use russh::{ChannelMsg, ChannelReadHalf, ChannelWriteHalf, server::Msg};
 use tokio::time::{MissedTickBehavior, interval, timeout};
 
 use crate::{
-    game::{Game, MAX_NAME, clean_name},
+    game::{Game, MAX_MESSAGE, MAX_NAME, chat_char, clean_name},
     input::{Key, Parser},
     ui::{self, View},
 };
@@ -140,6 +140,8 @@ async fn play(
     let mut parser = Parser::default();
     let mut name = clean_name(&user);
     let mut seat: Option<Seat> = None;
+    let mut draft = String::new();
+    let mut last_said: Option<Instant> = None;
     let mut last_input = Instant::now();
     let mut ticker = interval(FRAME);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -162,9 +164,34 @@ async fn play(
                                     name.push_str(&clean_name(&c.to_string()));
                                 }
                             }
-                            (Key::Enter, Some(_)) => lock(&game).press_enter(id, Instant::now()),
-                            (Key::Char(c), Some(_)) => lock(&game).key(id, c, Instant::now()),
-                            (Key::Backspace, Some(_)) => {}
+                            (Key::Enter, Some(_)) if draft.trim().is_empty() => {
+                                draft.clear();
+                                // Un double Entrée après un message ne change pas « prêt ».
+                                if last_said.is_none_or(|t| t.elapsed() > Duration::from_secs(1)) {
+                                    lock(&game).press_enter(id, Instant::now());
+                                }
+                            }
+                            (Key::Enter, Some(_)) => {
+                                let now = Instant::now();
+                                if lock(&game).say(id, &draft, now) {
+                                    draft.clear();
+                                    last_said = Some(now);
+                                }
+                            }
+                            (Key::Char(c), Some(_)) => {
+                                let now = Instant::now();
+                                let mut g = lock(&game);
+                                if !g.chat_open(now) {
+                                    g.key(id, c, now);
+                                } else if chat_char(c) && draft.chars().count() < MAX_MESSAGE {
+                                    draft.push(c);
+                                }
+                            }
+                            (Key::Backspace, Some(_)) => {
+                                if lock(&game).chat_open(Instant::now()) {
+                                    draft.pop();
+                                }
+                            }
                         }
                     }
                 }
@@ -184,7 +211,7 @@ async fn play(
 
         let out = if seat.is_some() {
             let snapshot = lock(&game).clone();
-            screen.frame(View::Game(&snapshot, id))?
+            screen.frame(View::Game(&snapshot, id, &draft))?
         } else {
             screen.frame(View::Naming(&name))?
         };

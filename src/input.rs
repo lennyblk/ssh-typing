@@ -21,6 +21,8 @@ enum State {
 pub struct Parser {
     state: State,
     pasting: bool,
+    /// Caractère UTF-8 en cours de réception.
+    utf8: Vec<u8>,
 }
 
 impl Parser {
@@ -29,6 +31,22 @@ impl Parser {
         for &b in bytes {
             match &mut self.state {
                 State::Ground => {
+                    if b >= 0x80 {
+                        if b >= 0xc0 {
+                            self.utf8.clear();
+                        }
+                        self.utf8.push(b);
+                        if let Ok(s) = std::str::from_utf8(&self.utf8) {
+                            if !self.pasting {
+                                keys.extend(s.chars().map(Key::Char));
+                            }
+                            self.utf8.clear();
+                        } else if self.utf8.len() >= 4 {
+                            self.utf8.clear();
+                        }
+                        continue;
+                    }
+                    self.utf8.clear();
                     let key = match b {
                         0x1b => {
                             self.state = State::Esc;
@@ -91,6 +109,8 @@ mod tests {
         assert_eq!(p.feed(b"a\x1b["), vec![Key::Char('a')]);
         assert_eq!(p.feed(b"Ab\r"), vec![Key::Char('b'), Key::Enter]);
         assert_eq!(p.feed(b"\x1b[200~paste\x1b[201~c"), vec![Key::Char('c')]);
+        assert_eq!(p.feed(b"\xc3"), vec![]);
+        assert_eq!(p.feed(b"\xa9\xff\xff\xff\xff\xffz"), vec![Key::Char('é'), Key::Char('z')]);
         assert_eq!(p.feed(b"\x1b\x03"), vec![Key::Quit]);
     }
 }

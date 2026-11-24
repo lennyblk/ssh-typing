@@ -1,5 +1,6 @@
 //! Logique de course. Aucune E/S : le temps est toujours passé en paramètre.
 
+use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 use crate::phrases;
@@ -19,6 +20,16 @@ pub const MAX_COUNTDOWN: Duration = Duration::from_secs(30);
 /// Grille pleine : inutile d'attendre davantage.
 pub const FULL_COUNTDOWN: Duration = Duration::from_secs(3);
 pub const MAX_NAME: usize = 16;
+
+pub const MAX_MESSAGE: usize = 120;
+const CHAT_HISTORY: usize = 50;
+/// Chat fermé avant le départ et juste après l'arrivée : les frappes de chat
+/// ne doivent pas tomber dans la course, ni l'inverse.
+const CHAT_LOCK: Duration = Duration::from_secs(3);
+const CHAT_REOPEN: Duration = Duration::from_millis(1500);
+/// Anti-flood : messages par seconde, et rafale tolérée.
+const CHAT_RATE: f64 = 0.5;
+const CHAT_BURST: f64 = 4.0;
 
 /// Anti-collage : frappes soutenues par seconde, et rafale tolérée (gigue réseau).
 const KEYS_PER_SEC: f64 = 30.0;
@@ -60,6 +71,15 @@ pub struct Player {
     pub ready: bool,
     pub wins: u32,
     pub run: Option<Run>,
+    chat_tokens: f64,
+    last_chat: Instant,
+}
+
+#[derive(Clone)]
+pub struct Message {
+    pub from: u64,
+    pub name: String,
+    pub text: String,
 }
 
 #[derive(Clone)]
@@ -71,6 +91,7 @@ pub struct Game {
     pub top: Vec<(String, u32)>,
     /// Durée de la course terminée, pour l'écran de résultats.
     pub race_time: Duration,
+    pub chat: VecDeque<Message>,
     solo: bool,
     /// Départ au plus tard, fixé au début du compte à rebours.
     latest_start: Instant,
@@ -83,6 +104,11 @@ pub fn clean_name(raw: &str) -> String {
         .collect()
 }
 
+/// Latin d'une colonne de large : ni contrôle, ni bidi, ni caractère combinant.
+pub fn chat_char(c: char) -> bool {
+    matches!(c, ' '..='~' | '\u{a1}'..='\u{ac}' | '\u{ae}'..='\u{24f}' | '€' | '’')
+}
+
 impl Game {
     pub fn new() -> Self {
         Game {
@@ -91,6 +117,7 @@ impl Game {
             text: phrases::pick(None),
             top: Vec::new(),
             race_time: Duration::ZERO,
+            chat: VecDeque::new(),
             solo: false,
             latest_start: Instant::now(),
         }
@@ -116,7 +143,15 @@ impl Game {
             name = format!("{}{suffix}", &base[..base.len().min(MAX_NAME - suffix.len())]);
             n += 1;
         }
-        self.players.push(Player { id, name, ready: true, wins: 0, run: None });
+        self.players.push(Player {
+            id,
+            name,
+            ready: true,
+            wins: 0,
+            run: None,
+            chat_tokens: CHAT_BURST,
+            last_chat: now,
+        });
         self.tick(now);
         if let Phase::Lobby { start_at: Some(t) } = self.phase
             && self.in_grid(id)
@@ -145,6 +180,38 @@ impl Game {
             p.ready = !p.ready;
         }
         self.tick(now);
+    }
+
+    pub fn chat_open(&self, now: Instant) -> bool {
+        match self.phase {
+            Phase::Lobby { start_at: None } => true,
+            Phase::Lobby { start_at: Some(t) } => t.saturating_duration_since(now) > CHAT_LOCK,
+            Phase::Racing { .. } => false,
+            Phase::Results { until } => {
+                until.saturating_duration_since(now) <= RESULTS - CHAT_REOPEN
+            }
+        }
+    }
+
+    /// Publie un message. Faux si le chat est fermé ou le joueur trop bavard.
+    pub fn say(&mut self, id: u64, text: &str, now: Instant) -> bool {
+        if !self.chat_open(now) {
+            return false;
+        }
+        let Some(p) = self.players.iter_mut().find(|p| p.id == id) else { return false };
+        let dt = now.saturating_duration_since(p.last_chat).as_secs_f64();
+        p.last_chat = now;
+        p.chat_tokens = (p.chat_tokens + dt * CHAT_RATE).min(CHAT_BURST);
+        if p.chat_tokens < 1.0 {
+            return false;
+        }
+        p.chat_tokens -= 1.0;
+        let text = text.trim().chars().filter(|&c| chat_char(c)).take(MAX_MESSAGE).collect();
+        self.chat.push_back(Message { from: id, name: p.name.clone(), text });
+        if self.chat.len() > CHAT_HISTORY {
+            self.chat.pop_front();
+        }
+        true
     }
 
     pub fn key(&mut self, id: u64, c: char, now: Instant) {
@@ -426,5 +493,34 @@ mod tests {
         g.tick(t + RACE_LIMIT);
         g.tick(t + RACE_LIMIT + RESULTS);
         assert!(g.in_grid(9) && g.in_grid(10) && !g.in_grid(8));
+    }
+
+    #[test]
+    fn chat_closed_around_race_and_rate_limited() {
+        let t = Instant::now();
+        let mut g = Game::new();
+        g.join(1, "ada", t);
+        g.join(2, "bob", t);
+        for _ in 0..4 {
+            assert!(g.say(1, "h\u{1b}é\u{202e}", t));
+        }
+        assert_eq!(g.chat[0].text, "hé");
+        assert!(!g.say(1, "flood", t));
+        assert!(g.say(2, "ok", t));
+        // Le chat ne décale pas le départ.
+        assert_eq!(g.phase, Phase::Lobby { start_at: Some(t + COUNTDOWN) });
+        assert!(!g.say(2, "trop tard", t + secs(7)));
+        g.tick(t + COUNTDOWN);
+        assert!(!g.say(2, "course", t + secs(11)));
+        let end = t + COUNTDOWN + RACE_LIMIT;
+        g.tick(end);
+        assert!(!g.chat_open(end + secs(1)));
+        assert!(g.say(2, "gg", end + secs(2)));
+        for i in 0..200 {
+            g.say(2, "x", end + secs(2));
+            g.tick(end + RESULTS);
+            g.say(2, "x", end + RESULTS + secs(3 * i));
+        }
+        assert!(g.chat.len() <= CHAT_HISTORY);
     }
 }

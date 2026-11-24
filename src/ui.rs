@@ -32,7 +32,7 @@ const LOGO: [&str; 3] = [
 
 pub enum View<'a> {
     Naming(&'a str),
-    Game(&'a Game, u64),
+    Game(&'a Game, u64, &'a str),
 }
 
 fn fg(c: Color) -> Style {
@@ -68,10 +68,10 @@ pub fn draw(buf: &mut Buffer, view: View, now: Instant) {
 
     match view {
         View::Naming(name) => naming(buf, area, name),
-        View::Game(g, me) => match g.phase {
-            Phase::Lobby { start_at } => lobby(buf, area, g, me, start_at, now),
+        View::Game(g, me, draft) => match g.phase {
+            Phase::Lobby { start_at } => lobby(buf, area, g, me, draft, start_at, now),
             Phase::Racing { start, ends } => race(buf, area, g, me, start, ends, now),
-            Phase::Results { until } => results(buf, area, g, me, until, now),
+            Phase::Results { until } => results(buf, area, g, me, draft, until, now),
         },
     }
 }
@@ -130,7 +130,66 @@ fn name_style(p: &Player, me: u64) -> Style {
     if p.id == me { bold(ACCENT) } else { fg(TEXT) }
 }
 
-fn lobby(buf: &mut Buffer, area: Rect, g: &Game, me: u64, start: Option<Instant>, now: Instant) {
+/// Hauteur de la liste : laisse au chat un filet, quelques messages et la saisie.
+fn list_rows(area: Rect, y: u16, wanted: usize) -> usize {
+    let avail = (area.bottom() - 2).saturating_sub(y) as usize;
+    let chat = if avail >= 13 { 5 } else { 4 };
+    wanted.min(avail.saturating_sub(chat))
+}
+
+fn chat(buf: &mut Buffer, area: Rect, y: u16, g: &Game, me: u64, draft: &str, now: Instant) {
+    rule(buf, area, y);
+    let input = area.bottom() - 2;
+    let width = area.width as usize;
+
+    let mut lines = Vec::new();
+    for m in &g.chat {
+        let head = m.name.len() + 2;
+        let body: Vec<char> = m.text.chars().collect();
+        for (i, (s, e)) in wrap(&body, width - head).into_iter().enumerate() {
+            let name = if i == 0 { format!("{}: ", m.name) } else { " ".repeat(head) };
+            let color = if m.from == me { ACCENT } else { GOOD };
+            lines.push(Line::from(vec![
+                Span::styled(name, fg(color)),
+                Span::styled(body[s..e].iter().collect::<String>(), fg(TEXT)),
+            ]));
+        }
+    }
+    let rows = input.saturating_sub(y + 1) as usize;
+    let skip = lines.len().saturating_sub(rows);
+    for (i, l) in lines.into_iter().skip(skip).enumerate() {
+        put(buf, area, y + 1 + i as u16, l);
+    }
+
+    let line = if !g.chat_open(now) {
+        Line::styled("> chat fermé : mains sur le clavier", fg(DIM))
+    } else if draft.is_empty() {
+        Line::from(vec![
+            Span::styled("> ", fg(ACCENT)),
+            Span::styled("█", fg(ACCENT)),
+            Span::styled(" écris un message", fg(DIM)),
+        ])
+    } else {
+        let n = draft.chars().count();
+        let tail: String = draft.chars().skip(n.saturating_sub(width - 3)).collect();
+        Line::from(vec![
+            Span::styled("> ", fg(ACCENT)),
+            Span::styled(tail, fg(TEXT)),
+            Span::styled("█", fg(ACCENT)),
+        ])
+    };
+    put(buf, area, input, line);
+}
+
+fn lobby(
+    buf: &mut Buffer,
+    area: Rect,
+    g: &Game,
+    me: u64,
+    draft: &str,
+    start: Option<Instant>,
+    now: Instant,
+) {
     let mut y = logo(buf, area);
     let ready = g.player(me).is_some_and(|p| p.ready);
     let alone = g.players.iter().filter(|p| p.ready).count() == 1 && ready;
@@ -150,8 +209,8 @@ fn lobby(buf: &mut Buffer, area: Rect, g: &Game, me: u64, start: Option<Instant>
     put(buf, right, y, Line::styled("Records du serveur", bold(TEXT)));
     y += 1;
 
-    let rows = (area.bottom() - 2).saturating_sub(y) as usize;
     let all: Vec<&Player> = g.players.iter().collect();
+    let rows = list_rows(area, y, all.len().max(g.top.len()).max(1));
     for (i, (_, p)) in window(&all, me, rows).into_iter().enumerate() {
         let queued = p.ready && !g.in_grid(p.id);
         let (mark, c) = if queued { ("… ", ACCENT) } else if p.ready { ("◆ ", GOOD) } else { ("◇ ", DIM) };
@@ -177,7 +236,9 @@ fn lobby(buf: &mut Buffer, area: Rect, g: &Game, me: u64, start: Option<Instant>
         ]);
         put(buf, right, y + i as u16, line);
     }
+    chat(buf, area, y + rows as u16, g, me, draft, now);
     let label = match (alone && start.is_none(), ready) {
+        _ if !draft.trim().is_empty() => "envoyer",
         (true, _) => "courir seul",
         (_, true) => "pas prêt",
         (_, false) => "prêt",
@@ -186,11 +247,10 @@ fn lobby(buf: &mut Buffer, area: Rect, g: &Game, me: u64, start: Option<Instant>
 }
 
 /// Coupe le texte sur les espaces ; renvoie des intervalles [début, fin).
-pub fn wrap(text: &str, width: usize) -> Vec<(usize, usize)> {
-    let b = text.as_bytes();
+pub fn wrap(b: &[char], width: usize) -> Vec<(usize, usize)> {
     let (mut out, mut start) = (Vec::new(), 0);
     while b.len() - start > width {
-        let cut = (start + 1..start + width).rev().find(|&i| b[i] == b' ').map_or(start + width, |i| i + 1);
+        let cut = (start + 1..start + width).rev().find(|&i| b[i] == ' ').map_or(start + width, |i| i + 1);
         out.push((start, cut));
         start = cut;
     }
@@ -205,7 +265,8 @@ fn race(buf: &mut Buffer, area: Rect, g: &Game, me: u64, start: Instant, ends: I
     let mine = g.player(me).and_then(|p| p.run.as_ref());
 
     let text = g.text();
-    for (s, e) in wrap(text, area.width as usize) {
+    let chars: Vec<char> = text.chars().collect();
+    for (s, e) in wrap(&chars, area.width as usize) {
         let spans: Vec<Span> = text[s..e]
             .char_indices()
             .map(|(i, c)| {
@@ -253,14 +314,23 @@ fn race(buf: &mut Buffer, area: Rect, g: &Game, me: u64, start: Instant, ends: I
     footer(buf, area, &[("···", hint)]);
 }
 
-fn results(buf: &mut Buffer, area: Rect, g: &Game, me: u64, until: Instant, now: Instant) {
+fn results(
+    buf: &mut Buffer,
+    area: Rect,
+    g: &Game,
+    me: u64,
+    draft: &str,
+    until: Instant,
+    now: Instant,
+) {
     let right = format!("salon dans {}", secs_left(until, now));
     let mut y = header(buf, area, "ARRIVÉE", right, DIM);
     let head = format!("{:>2} {:<17}{:>8}{:>9}{:>10}", "#", "joueur", "mpm", "préc.", "temps");
     put(buf, area, y, Line::styled(head, fg(DIM)));
     y += 1;
-    let rows = (area.bottom() - 2).saturating_sub(y) as usize;
-    for (i, (rank, p)) in window(&g.ranking(), me, rows).into_iter().enumerate() {
+    let ranking = g.ranking();
+    let rows = list_rows(area, y, ranking.len());
+    for (i, (rank, p)) in window(&ranking, me, rows).into_iter().enumerate() {
         let r = p.run.as_ref().unwrap();
         let time = match r.finish {
             Some(t) => format!("{:.1}s", t.as_secs_f32()),
@@ -276,7 +346,8 @@ fn results(buf: &mut Buffer, area: Rect, g: &Game, me: u64, until: Instant, now:
         ]);
         put(buf, area, y + i as u16, line);
     }
-    footer(buf, area, &[]);
+    chat(buf, area, y + rows as u16, g, me, draft, now);
+    footer(buf, area, &[("Entrée", "envoyer")]);
 }
 
 #[cfg(test)]
@@ -287,7 +358,7 @@ mod tests {
     fn wrap_covers_everything() {
         for t in crate::phrases::TEXTS {
             for w in [20, 56, 92] {
-                let parts = wrap(t, w);
+                let parts = wrap(&t.chars().collect::<Vec<_>>(), w);
                 assert!(parts.iter().all(|(s, e)| e - s <= w));
                 assert_eq!(parts.iter().map(|&(s, e)| &t[s..e]).collect::<String>(), *t);
             }
@@ -301,13 +372,16 @@ mod tests {
         for i in 0..30 {
             g.join(i, "ada", now);
         }
+        for id in 0..30 {
+            g.say(id, &"é".repeat(120), now);
+        }
         for (w, h) in [(1, 1), (60, 18), (80, 24), (300, 100)] {
             let mut t = now;
             for step in [0, 10, 130, 8] {
                 t += Duration::from_secs(step);
                 g.tick(t);
                 let mut buf = Buffer::empty(Rect::new(0, 0, w, h));
-                draw(&mut buf, View::Game(&g, 29), t);
+                draw(&mut buf, View::Game(&g, 29, &"é".repeat(120)), t);
                 draw(&mut buf, View::Naming("x"), t);
             }
         }
