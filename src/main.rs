@@ -1,12 +1,13 @@
 mod game;
 mod input;
 mod phrases;
+mod records;
 mod session;
 mod ui;
 
 use std::collections::HashMap;
 use std::net::IpAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -154,13 +155,29 @@ async fn main() -> Result<()> {
         ..Default::default()
     });
 
-    let game: Shared = Arc::new(Mutex::new(Game::new()));
+    let records_path =
+        PathBuf::from(std::env::var("RECORDS").unwrap_or_else(|_| "records.txt".into()));
+    let mut state = Game::new();
+    // Illisible : on refuse de démarrer plutôt que d'écraser les records.
+    state.top = records::load(&records_path).context("lecture des records")?;
+    let mut saved = state.top.clone();
+    let game: Shared = Arc::new(Mutex::new(state));
     let clock = game.clone();
     tokio::spawn(async move {
         let mut t = tokio::time::interval(Duration::from_millis(50));
         loop {
             t.tick().await;
-            clock.lock().unwrap_or_else(|e| e.into_inner()).tick(Instant::now());
+            let top = {
+                let mut g = clock.lock().unwrap_or_else(|e| e.into_inner());
+                g.tick(Instant::now());
+                g.top.clone()
+            };
+            if top != saved {
+                if let Err(e) = records::save(&records_path, &top) {
+                    eprintln!("sauvegarde des records : {e}");
+                }
+                saved = top;
+            }
         }
     });
 

@@ -10,7 +10,7 @@ use ratatui::{
     widgets::{Paragraph, Widget},
 };
 
-use crate::game::{Game, MAX_RACERS, Phase, Player};
+use crate::game::{CHAT_COLORS, Game, MAX_RACERS, Phase, Player};
 
 const ACCENT: Color = Color::Indexed(215);
 const DIM: Color = Color::Indexed(245);
@@ -20,6 +20,19 @@ const KEY_BG: Color = Color::Indexed(238);
 const TEXT: Color = Color::Indexed(252);
 const GOOD: Color = Color::Indexed(114);
 const BAD: Color = Color::Indexed(203);
+
+/// Une couleur par personne dans le chat, les plus contrastées d'abord.
+const CHAT_PALETTE: [Color; CHAT_COLORS] = {
+    const I: [u8; CHAT_COLORS] =
+        [215, 81, 114, 213, 228, 203, 141, 43, 208, 111, 155, 175, 180, 87, 99, 197];
+    let mut out = [Color::Reset; CHAT_COLORS];
+    let mut i = 0;
+    while i < CHAT_COLORS {
+        out[i] = Color::Indexed(I[i]);
+        i += 1;
+    }
+    out
+};
 
 pub const MIN_W: u16 = 60;
 pub const MIN_H: u16 = 18;
@@ -137,7 +150,7 @@ fn list_rows(area: Rect, y: u16, wanted: usize) -> usize {
     wanted.min(avail.saturating_sub(chat))
 }
 
-fn chat(buf: &mut Buffer, area: Rect, y: u16, g: &Game, me: u64, draft: &str, now: Instant) {
+fn chat(buf: &mut Buffer, area: Rect, y: u16, g: &Game, draft: &str, now: Instant) {
     rule(buf, area, y);
     let input = area.bottom() - 2;
     let width = area.width as usize;
@@ -148,9 +161,9 @@ fn chat(buf: &mut Buffer, area: Rect, y: u16, g: &Game, me: u64, draft: &str, no
         let body: Vec<char> = m.text.chars().collect();
         for (i, (s, e)) in wrap(&body, width - head).into_iter().enumerate() {
             let name = if i == 0 { format!("{}: ", m.name) } else { " ".repeat(head) };
-            let color = if m.from == me { ACCENT } else { GOOD };
+            let color = CHAT_PALETTE[m.color % CHAT_COLORS];
             lines.push(Line::from(vec![
-                Span::styled(name, fg(color)),
+                Span::styled(name, bold(color)),
                 Span::styled(body[s..e].iter().collect::<String>(), fg(TEXT)),
             ]));
         }
@@ -236,7 +249,7 @@ fn lobby(
         ]);
         put(buf, right, y + i as u16, line);
     }
-    chat(buf, area, y + rows as u16, g, me, draft, now);
+    chat(buf, area, y + rows as u16, g, draft, now);
     let label = match (alone && start.is_none(), ready) {
         _ if !draft.trim().is_empty() => "envoyer",
         (true, _) => "courir seul",
@@ -346,7 +359,7 @@ fn results(
         ]);
         put(buf, area, y + i as u16, line);
     }
-    chat(buf, area, y + rows as u16, g, me, draft, now);
+    chat(buf, area, y + rows as u16, g, draft, now);
     footer(buf, area, &[("Entrée", "envoyer")]);
 }
 

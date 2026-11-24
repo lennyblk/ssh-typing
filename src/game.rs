@@ -21,7 +21,10 @@ pub const MAX_COUNTDOWN: Duration = Duration::from_secs(30);
 pub const FULL_COUNTDOWN: Duration = Duration::from_secs(3);
 pub const MAX_NAME: usize = 16;
 
+pub const MAX_RECORDS: usize = 5;
 pub const MAX_MESSAGE: usize = 120;
+/// Taille de la palette du chat ; au-delà, les couleurs se répètent.
+pub const CHAT_COLORS: usize = 16;
 const CHAT_HISTORY: usize = 50;
 /// Chat fermé avant le départ et juste après l'arrivée : les frappes de chat
 /// ne doivent pas tomber dans la course, ni l'inverse.
@@ -68,6 +71,8 @@ impl Run {
 pub struct Player {
     pub id: u64,
     pub name: String,
+    /// Indice de couleur dans le chat, libre parmi les connectés.
+    pub color: usize,
     pub ready: bool,
     pub wins: u32,
     pub run: Option<Run>,
@@ -77,7 +82,7 @@ pub struct Player {
 
 #[derive(Clone)]
 pub struct Message {
-    pub from: u64,
+    pub color: usize,
     pub name: String,
     pub text: String,
 }
@@ -87,11 +92,13 @@ pub struct Game {
     pub phase: Phase,
     pub players: Vec<Player>,
     pub text: usize,
-    /// Meilleurs scores depuis le démarrage du serveur.
+    /// Meilleurs scores, conservés entre deux démarrages (voir `records`).
     pub top: Vec<(String, u32)>,
     /// Durée de la course terminée, pour l'écran de résultats.
     pub race_time: Duration,
     pub chat: VecDeque<Message>,
+    /// Textes restant à jouer avant de remélanger.
+    bag: Vec<usize>,
     solo: bool,
     /// Départ au plus tard, fixé au début du compte à rebours.
     latest_start: Instant,
@@ -114,7 +121,8 @@ impl Game {
         Game {
             phase: Phase::Lobby { start_at: None },
             players: Vec::new(),
-            text: phrases::pick(None),
+            text: 0,
+            bag: phrases::shuffled(None),
             top: Vec::new(),
             race_time: Duration::ZERO,
             chat: VecDeque::new(),
@@ -143,9 +151,16 @@ impl Game {
             name = format!("{}{suffix}", &base[..base.len().min(MAX_NAME - suffix.len())]);
             n += 1;
         }
+        // Couleur la moins récemment vue dans le chat parmi celles qui sont libres.
+        let color = (0..)
+            .filter(|c| self.players.iter().all(|p| p.color != *c))
+            .take(CHAT_COLORS.saturating_sub(self.players.len()).max(1))
+            .min_by_key(|c| self.chat.iter().rposition(|m| m.color == *c).map_or(0, |i| i + 1))
+            .unwrap();
         self.players.push(Player {
             id,
             name,
+            color,
             ready: true,
             wins: 0,
             run: None,
@@ -207,7 +222,7 @@ impl Game {
         }
         p.chat_tokens -= 1.0;
         let text = text.trim().chars().filter(|&c| chat_char(c)).take(MAX_MESSAGE).collect();
-        self.chat.push_back(Message { from: id, name: p.name.clone(), text });
+        self.chat.push_back(Message { color: p.color, name: p.name.clone(), text });
         if self.chat.len() > CHAT_HISTORY {
             self.chat.pop_front();
         }
@@ -265,7 +280,7 @@ impl Game {
             None => self.top.push((name, wpm)),
         }
         self.top.sort_by_key(|e| std::cmp::Reverse(e.1));
-        self.top.truncate(5);
+        self.top.truncate(MAX_RECORDS);
     }
 
     /// Vrai si le joueur fait partie des premiers prêts de la file.
@@ -331,7 +346,10 @@ impl Game {
     }
 
     fn start(&mut self, now: Instant) {
-        self.text = phrases::pick(Some(self.text));
+        if self.bag.is_empty() {
+            self.bag = phrases::shuffled(Some(self.text));
+        }
+        self.text = self.bag.pop().unwrap();
         let mut places = MAX_RACERS;
         for p in &mut self.players {
             let racing = p.ready && places > 0;
@@ -522,5 +540,46 @@ mod tests {
             g.say(2, "x", end + RESULTS + secs(3 * i));
         }
         assert!(g.chat.len() <= CHAT_HISTORY);
+    }
+
+    #[test]
+    fn every_text_plays_once_before_repeating() {
+        let t = Instant::now();
+        let mut g = Game::new();
+        let n = phrases::TEXTS.len();
+        let mut seen = Vec::new();
+        for _ in 0..2 * n {
+            g.start(t);
+            seen.push(g.text);
+        }
+        for round in seen.chunks(n) {
+            assert_eq!(round.iter().collect::<std::collections::HashSet<_>>().len(), n);
+        }
+        assert_ne!(seen[n - 1], seen[n]);
+    }
+
+    #[test]
+    fn chat_colors_are_distinct() {
+        let t = Instant::now();
+        let mut g = Game::new();
+        for id in 0..64 {
+            g.join(id, "a", t);
+        }
+        let colors: std::collections::HashSet<_> =
+            g.players[..CHAT_COLORS].iter().map(|p| p.color).collect();
+        assert_eq!(colors.len(), CHAT_COLORS);
+        assert!(colors.iter().all(|c| *c < CHAT_COLORS));
+    }
+
+    #[test]
+    fn newcomer_avoids_color_of_someone_who_left() {
+        let t = Instant::now();
+        let mut g = Game::new();
+        g.join(1, "ada", t);
+        g.say(1, "salut", t);
+        let old = g.player(1).unwrap().color;
+        g.leave(1, t);
+        g.join(2, "bob", t);
+        assert_ne!(g.player(2).unwrap().color, old);
     }
 }

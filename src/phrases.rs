@@ -1,5 +1,7 @@
 //! Textes de course. ASCII uniquement : tapables sur n'importe quel clavier.
 
+use rand::seq::SliceRandom;
+
 pub const TEXTS: &[&str] = &[
     "la cendre tombe sans bruit sur les remparts. personne ne se souvient du nom des rois, mais tous se souviennent du froid.",
     "celui qui court plus vite que la nuit n'a pas besoin de lanterne. garde le souffle court, la main ferme et le regard loin devant.",
@@ -73,13 +75,15 @@ pub const TEXTS: &[&str] = &[
     "au fond du puits, quelqu'un a allume une lampe. depuis, les etoiles se penchent le soir pour regarder en bas.",
 ];
 
-pub fn pick(previous: Option<usize>) -> usize {
-    loop {
-        let i = rand::random_range(0..TEXTS.len());
-        if Some(i) != previous {
-            return i;
-        }
+/// Ordre de passage aléatoire où chaque texte sort une fois, `last` n'étant pas
+/// rejoué d'affilée. Se consomme par la fin.
+pub fn shuffled(last: Option<usize>) -> Vec<usize> {
+    let mut bag: Vec<usize> = (0..TEXTS.len()).collect();
+    bag.shuffle(&mut rand::rng());
+    if bag.last().copied() == last {
+        bag.reverse();
     }
+    bag
 }
 
 #[cfg(test)]
