@@ -22,8 +22,9 @@ use tokio::net::TcpListener;
 use crate::game::Game;
 use crate::session::Shared;
 
-const MAX_CONNECTIONS: usize = 64;
-const MAX_PER_IP: usize = 8;
+/// Garde-fous du serveur, pas du jeu. Réglables par variables d'environnement.
+const MAX_CONNECTIONS: usize = 300;
+const MAX_PER_IP: usize = 40;
 const LOGIN_DEADLINE: Duration = Duration::from_secs(20);
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
@@ -109,12 +110,12 @@ struct Slot {
 }
 
 impl Slot {
-    fn take(ips: &Arc<Mutex<HashMap<IpAddr, usize>>>, ip: IpAddr) -> Option<Slot> {
+    fn take(ips: &Arc<Mutex<HashMap<IpAddr, usize>>>, ip: IpAddr, total: usize, per_ip: usize) -> Option<Slot> {
         let mut map = ips.lock().unwrap();
-        if map.values().sum::<usize>() >= MAX_CONNECTIONS {
+        if map.values().sum::<usize>() >= total {
             return None;
         }
-        if map.get(&ip).copied().unwrap_or(0) >= MAX_PER_IP {
+        if map.get(&ip).copied().unwrap_or(0) >= per_ip {
             return None;
         }
         *map.entry(ip).or_default() += 1;
@@ -134,12 +135,22 @@ impl Drop for Slot {
     }
 }
 
+fn env_limit(name: &str, default: usize) -> Result<usize> {
+    match std::env::var(name) {
+        Ok(v) => v.parse().with_context(|| format!("{name} invalide : {v}")),
+        Err(_) => Ok(default),
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Sortie vers des clients distants : NO_COLOR côté serveur n'a pas de sens.
     crossterm::style::force_color_output(true);
     let listen = std::env::var("LISTEN").unwrap_or_else(|_| "0.0.0.0:2222".into());
     let key_path = std::env::var("HOST_KEY").unwrap_or_else(|_| "host_key".into());
+
+    let total = env_limit("MAX_CONNECTIONS", MAX_CONNECTIONS)?;
+    let per_ip = env_limit("MAX_PER_IP", MAX_PER_IP)?;
 
     let mut methods = MethodSet::empty();
     methods.push(MethodKind::None);
@@ -193,7 +204,7 @@ async fn main() -> Result<()> {
                 continue;
             }
         };
-        let Some(slot) = Slot::take(&ips, peer.ip()) else { continue };
+        let Some(slot) = Slot::take(&ips, peer.ip(), total, per_ip) else { continue };
         let _ = stream.set_nodelay(true);
         let opened = Arc::new(AtomicBool::new(false));
         let client = Client { game: game.clone(), user: String::new(), opened: opened.clone() };

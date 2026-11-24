@@ -11,14 +11,10 @@ pub const RACE_LIMIT: Duration = Duration::from_secs(120);
 /// Temps laissé aux autres après la première arrivée.
 pub const AFTER_FIRST: Duration = Duration::from_secs(20);
 pub const RESULTS: Duration = Duration::from_secs(8);
-/// Coureurs par course ; les autres attendent leur tour.
-pub const MAX_RACERS: usize = 8;
 /// Temps minimal garanti à quelqu'un qui rejoint pendant le compte à rebours.
 pub const JOIN_GRACE: Duration = Duration::from_secs(5);
 /// Les arrivées ne peuvent pas repousser le départ au-delà.
 pub const MAX_COUNTDOWN: Duration = Duration::from_secs(30);
-/// Grille pleine : inutile d'attendre davantage.
-pub const FULL_COUNTDOWN: Duration = Duration::from_secs(3);
 pub const MAX_NAME: usize = 16;
 
 pub const MAX_RECORDS: usize = 5;
@@ -168,10 +164,7 @@ impl Game {
             last_chat: now,
         });
         self.tick(now);
-        if let Phase::Lobby { start_at: Some(t) } = self.phase
-            && self.in_grid(id)
-            && self.ready_count() < MAX_RACERS
-        {
+        if let Phase::Lobby { start_at: Some(t) } = self.phase {
             let t = t.max((now + JOIN_GRACE).min(self.latest_start));
             self.phase = Phase::Lobby { start_at: Some(t) };
         }
@@ -283,11 +276,6 @@ impl Game {
         self.top.truncate(MAX_RECORDS);
     }
 
-    /// Vrai si le joueur fait partie des premiers prêts de la file.
-    pub fn in_grid(&self, id: u64) -> bool {
-        self.players.iter().filter(|p| p.ready).take(MAX_RACERS).any(|p| p.id == id)
-    }
-
     pub fn ready_count(&self) -> usize {
         self.players.iter().filter(|p| p.ready).count()
     }
@@ -309,10 +297,6 @@ impl Game {
                         self.phase = Phase::Lobby { start_at: Some(now + wait) };
                     }
                     Some(t) if now >= t => self.start(now),
-                    Some(t) if ready >= MAX_RACERS => {
-                        let t = t.min(now + FULL_COUNTDOWN);
-                        self.phase = Phase::Lobby { start_at: Some(t) };
-                    }
                     Some(_) => {}
                 }
             }
@@ -329,8 +313,6 @@ impl Game {
             }
             Phase::Results { until } => {
                 if now >= until {
-                    // Ceux qui attendaient passent devant ; tri stable.
-                    self.players.sort_by_key(|p| p.run.is_some());
                     for p in &mut self.players {
                         // Aucune frappe pendant la course : joueur absent.
                         if let Some(r) = p.run.take() {
@@ -350,11 +332,8 @@ impl Game {
             self.bag = phrases::shuffled(Some(self.text));
         }
         self.text = self.bag.pop().unwrap();
-        let mut places = MAX_RACERS;
         for p in &mut self.players {
-            let racing = p.ready && places > 0;
-            places -= racing as usize;
-            p.run = racing.then_some(Run {
+            p.run = p.ready.then_some(Run {
                 pos: 0,
                 errors: 0,
                 wrong: false,
@@ -494,23 +473,14 @@ mod tests {
     }
 
     #[test]
-    fn eight_racers_then_waiting_players_first() {
+    fn everyone_ready_races() {
         let t = Instant::now();
         let mut g = Game::new();
-        for id in 1..=10 {
+        for id in 0..100 {
             g.join(id, "a", t);
         }
-        assert_eq!(g.phase, Phase::Lobby { start_at: Some(t + FULL_COUNTDOWN) });
-        let t = t + FULL_COUNTDOWN;
-        g.tick(t);
-        assert_eq!(g.ranking().len(), MAX_RACERS);
-        assert!(g.player(9).unwrap().run.is_none());
-        for id in 1..=8 {
-            g.key(id, '~', t + secs(1));
-        }
-        g.tick(t + RACE_LIMIT);
-        g.tick(t + RACE_LIMIT + RESULTS);
-        assert!(g.in_grid(9) && g.in_grid(10) && !g.in_grid(8));
+        g.tick(t + MAX_COUNTDOWN);
+        assert_eq!(g.ranking().len(), 100);
     }
 
     #[test]

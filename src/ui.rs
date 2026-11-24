@@ -10,7 +10,7 @@ use ratatui::{
     widgets::{Paragraph, Widget},
 };
 
-use crate::game::{CHAT_COLORS, Game, MAX_RACERS, Phase, Player};
+use crate::game::{CHAT_COLORS, Game, Phase, Player};
 
 const ACCENT: Color = Color::Indexed(215);
 const DIM: Color = Color::Indexed(245);
@@ -218,22 +218,19 @@ fn lobby(
     let half = area.width / 2;
     let left = Rect { width: half - 1, ..area };
     let right = Rect { x: area.x + half + 1, width: area.width - half - 1, ..area };
-    put(buf, left, y, Line::styled(format!("Joueurs ({}/{MAX_RACERS})", g.ready_count().min(MAX_RACERS)), bold(TEXT)));
+    put(buf, left, y, Line::styled(format!("Joueurs ({} prêts sur {})", g.ready_count(), g.players.len()), bold(TEXT)));
     put(buf, right, y, Line::styled("Records du serveur", bold(TEXT)));
     y += 1;
 
     let all: Vec<&Player> = g.players.iter().collect();
     let rows = list_rows(area, y, all.len().max(g.top.len()).max(1));
     for (i, (_, p)) in window(&all, me, rows).into_iter().enumerate() {
-        let queued = p.ready && !g.in_grid(p.id);
-        let (mark, c) = if queued { ("… ", ACCENT) } else if p.ready { ("◆ ", GOOD) } else { ("◇ ", DIM) };
+        let (mark, c) = if p.ready { ("◆ ", GOOD) } else { ("◇ ", DIM) };
         let mut spans = vec![
             Span::styled(mark, fg(c)),
             Span::styled(format!("{:<17}", p.name), name_style(p, me)),
         ];
-        if queued {
-            spans.push(Span::styled("en file", fg(DIM)));
-        } else if p.wins > 0 {
+        if p.wins > 0 {
             spans.push(Span::styled(format!("{} vict.", p.wins), fg(DIM)));
         }
         put(buf, left, y + i as u16, Line::from(spans));
@@ -273,8 +270,10 @@ pub fn wrap(b: &[char], width: usize) -> Vec<(usize, usize)> {
 
 fn race(buf: &mut Buffer, area: Rect, g: &Game, me: u64, start: Instant, ends: Instant, now: Instant) {
     let left = secs_left(ends, now);
+    let ranking = g.ranking();
+    let title = format!("COURSE · {} en piste", ranking.len());
     let color = if left <= 20 { BAD } else { DIM };
-    let mut y = header(buf, area, "COURSE", format!("{left}s"), color);
+    let mut y = header(buf, area, &title, format!("{left}s"), color);
     let mine = g.player(me).and_then(|p| p.run.as_ref());
 
     let text = g.text();
@@ -304,7 +303,7 @@ fn race(buf: &mut Buffer, area: Rect, g: &Game, me: u64, start: Instant, ends: I
 
     let elapsed = now.saturating_duration_since(start);
     let rows = (area.bottom() - 1).saturating_sub(y) as usize;
-    for (i, (rank, p)) in window(&g.ranking(), me, rows).into_iter().enumerate() {
+    for (i, (rank, p)) in window(&ranking, me, rows).into_iter().enumerate() {
         let r = p.run.as_ref().unwrap();
         let bar = (area.width as usize).saturating_sub(32);
         let filled = r.pos * bar / text.len();
