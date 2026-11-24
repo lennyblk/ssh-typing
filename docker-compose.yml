@@ -1,0 +1,25 @@
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+  ssh-typing:
+    build: .
+    container_name: ssh-typing
+    restart: unless-stopped
+    logging: *default-logging
+    ports:
+      - "${GAME_BIND:-0.0.0.0:2222}:2222"
+    volumes:
+      - ssh-typing-data:/data
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 256m
+    cpus: 1
+    pids_limit: 64
+
+volumes:
+  ssh-typing-data:
