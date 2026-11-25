@@ -6,6 +6,10 @@ pub enum Key {
     Enter,
     Backspace,
     Quit,
+    Tab,
+    Profile,
+    Left,
+    Right,
 }
 
 #[derive(Default)]
@@ -23,6 +27,14 @@ pub struct Parser {
     pasting: bool,
     /// Caractère UTF-8 en cours de réception.
     utf8: Vec<u8>,
+}
+
+fn arrow(b: u8) -> Option<Key> {
+    match b {
+        b'C' => Some(Key::Right),
+        b'D' => Some(Key::Left),
+        _ => None,
+    }
 }
 
 impl Parser {
@@ -57,6 +69,8 @@ impl Parser {
                             continue;
                         }
                         b'\r' => Key::Enter,
+                        b'\t' => Key::Tab,
+                        0x10 => Key::Profile, // Ctrl+P
                         8 | 0x7f => Key::Backspace,
                         0x20..=0x7e => Key::Char(b as char),
                         _ => continue,
@@ -78,12 +92,16 @@ impl Parser {
                         _ => State::Ground,
                     }
                 }
-                State::Ss3 => self.state = State::Ground,
+                State::Ss3 => {
+                    keys.extend(arrow(b));
+                    self.state = State::Ground;
+                }
                 State::Csi(params) => {
                     if (0x40..=0x7e).contains(&b) {
                         match (params.as_slice(), b) {
                             (b"200", b'~') => self.pasting = true,
                             (b"201", b'~') => self.pasting = false,
+                            (b"", _) if !self.pasting => keys.extend(arrow(b)),
                             _ => {}
                         }
                         self.state = State::Ground;
@@ -109,6 +127,7 @@ mod tests {
         assert_eq!(p.feed(b"a\x1b["), vec![Key::Char('a')]);
         assert_eq!(p.feed(b"Ab\r"), vec![Key::Char('b'), Key::Enter]);
         assert_eq!(p.feed(b"\x1b[200~paste\x1b[201~c"), vec![Key::Char('c')]);
+        assert_eq!(p.feed(b"\x1b[D\x1bOC\x1b[A"), vec![Key::Left, Key::Right]);
         assert_eq!(p.feed(b"\xc3"), vec![]);
         assert_eq!(p.feed(b"\xa9\xff\xff\xff\xff\xffz"), vec![Key::Char('é'), Key::Char('z')]);
         assert_eq!(p.feed(b"\x1b\x03"), vec![Key::Quit]);

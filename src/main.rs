@@ -1,9 +1,11 @@
+mod accounts;
 mod game;
 mod input;
 mod phrases;
 mod records;
 mod session;
 mod ui;
+mod world;
 
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -18,14 +20,19 @@ use russh::keys::{Algorithm, PrivateKey};
 use russh::server::{self, Auth, ChannelOpenHandle, Handler, Msg, Session};
 use russh::{Channel, ChannelId, MethodKind, MethodSet, Pty};
 use tokio::net::TcpListener;
+use tokio::signal::unix::{SignalKind, signal};
 
 use crate::game::Game;
-use crate::session::Shared;
+use crate::accounts::Accounts;
+use crate::session::{Shared, lock};
+use crate::world::World;
 
 /// Garde-fous du serveur, pas du jeu. Réglables par variables d'environnement.
 const MAX_CONNECTIONS: usize = 300;
 const MAX_PER_IP: usize = 40;
 const LOGIN_DEADLINE: Duration = Duration::from_secs(20);
+
+const SAVE_EVERY: Duration = Duration::from_secs(1);
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -135,6 +142,35 @@ impl Drop for Slot {
     }
 }
 
+struct Store {
+    records_path: PathBuf,
+    accounts_path: PathBuf,
+    saved: records::Records,
+}
+
+impl Store {
+    /// Écrit ce qui a changé ; en cas d'échec, réessaie au prochain passage.
+    fn save(&mut self, shared: &Shared) {
+        let (top, json) = {
+            let mut w = lock(shared);
+            let dirty = std::mem::take(&mut w.accounts.dirty);
+            (w.game.top.clone(), dirty.then(|| w.accounts.to_json()))
+        };
+        if top != self.saved {
+            match records::save(&self.records_path, &top) {
+                Ok(()) => self.saved = top,
+                Err(e) => eprintln!("sauvegarde des records : {e}"),
+            }
+        }
+        if let Some(json) = json
+            && let Err(e) = records::write_atomic(&self.accounts_path, &json)
+        {
+            eprintln!("sauvegarde des comptes : {e}");
+            lock(shared).accounts.dirty = true;
+        }
+    }
+}
+
 fn env_limit(name: &str, default: usize) -> Result<usize> {
     match std::env::var(name) {
         Ok(v) => v.parse().with_context(|| format!("{name} invalide : {v}")),
@@ -160,7 +196,8 @@ async fn main() -> Result<()> {
         auth_rejection_time: Duration::from_secs(1),
         auth_rejection_time_initial: Some(Duration::ZERO),
         max_auth_attempts: 3,
-        keepalive_interval: Some(Duration::from_secs(30)),
+        // Court : après une coupure, le pseudo reste pris jusqu'à la détection.
+        keepalive_interval: Some(Duration::from_secs(10)),
         keepalive_max: 3,
         nodelay: true,
         ..Default::default()
@@ -168,26 +205,29 @@ async fn main() -> Result<()> {
 
     let records_path =
         PathBuf::from(std::env::var("RECORDS").unwrap_or_else(|_| "records.txt".into()));
+    let accounts_path =
+        PathBuf::from(std::env::var("ACCOUNTS").unwrap_or_else(|_| "accounts.json".into()));
     let mut state = Game::new();
-    // Illisible : on refuse de démarrer plutôt que d'écraser les records.
+    // Illisible : on refuse de démarrer plutôt que d'écraser les données.
     state.top = records::load(&records_path).context("lecture des records")?;
-    let mut saved = state.top.clone();
-    let game: Shared = Arc::new(Mutex::new(state));
+    let accounts = Accounts::load(&accounts_path).context("lecture des comptes")?;
+    let mut store = Store { records_path, accounts_path, saved: state.top.clone() };
+    let game: Shared = Arc::new(Mutex::new(World { game: state, accounts }));
+
     let clock = game.clone();
     tokio::spawn(async move {
-        let mut t = tokio::time::interval(Duration::from_millis(50));
+        let mut stop = signal(SignalKind::terminate()).expect("SIGTERM");
+        let mut tick = tokio::time::interval(Duration::from_millis(50));
+        let mut save = tokio::time::interval(SAVE_EVERY);
         loop {
-            t.tick().await;
-            let top = {
-                let mut g = clock.lock().unwrap_or_else(|e| e.into_inner());
-                g.tick(Instant::now());
-                g.top.clone()
-            };
-            if top != saved {
-                if let Err(e) = records::save(&records_path, &top) {
-                    eprintln!("sauvegarde des records : {e}");
+            tokio::select! {
+                _ = tick.tick() => lock(&clock).tick(Instant::now()),
+                _ = save.tick() => store.save(&clock),
+                _ = stop.recv() => {
+                    lock(&clock).tick(Instant::now());
+                    store.save(&clock);
+                    std::process::exit(0);
                 }
-                saved = top;
             }
         }
     });

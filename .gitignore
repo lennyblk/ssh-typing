@@ -2,3 +2,5 @@
 host_key
 records.txt
 records.tmp
+accounts.json
+accounts.tmp

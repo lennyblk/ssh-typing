@@ -2,3 +2,5 @@ target
 .git
 host_key
 records.*
+accounts.*
+!src/accounts.rs

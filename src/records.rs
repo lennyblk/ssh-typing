@@ -1,6 +1,6 @@
 //! Records sur disque : une ligne « mpm nom » par joueur.
 
-use std::{fs, io, path::Path};
+use std::{fs, io, io::Write, path::Path};
 
 use crate::game::{MAX_RECORDS, clean_name};
 
@@ -26,11 +26,17 @@ pub fn load(path: &Path) -> io::Result<Records> {
 }
 
 /// Écrit à côté puis renomme : jamais de fichier à moitié écrit.
-pub fn save(path: &Path, records: &Records) -> io::Result<()> {
+pub fn write_atomic(path: &Path, text: &str) -> io::Result<()> {
     let tmp = path.with_extension("tmp");
-    let text: String = records.iter().map(|(n, w)| format!("{w} {n}\n")).collect();
-    fs::write(&tmp, text)?;
+    let mut f = fs::File::create(&tmp)?;
+    f.write_all(text.as_bytes())?;
+    f.sync_all()?;
     fs::rename(&tmp, path)
+}
+
+pub fn save(path: &Path, records: &Records) -> io::Result<()> {
+    let text: String = records.iter().map(|(n, w)| format!("{w} {n}\n")).collect();
+    write_atomic(path, &text)
 }
 
 #[cfg(test)]

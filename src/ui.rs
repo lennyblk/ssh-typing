@@ -7,10 +7,11 @@ use ratatui::{
     layout::Rect,
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Paragraph, Widget},
+    widgets::{Block, BorderType, Paragraph, Widget},
 };
 
-use crate::game::{CHAT_COLORS, Game, Phase, Player};
+use crate::accounts::Stats;
+use crate::game::{CHAT_COLORS, Game, Mode, POINTS_TO_WIN, Phase, Player, Team};
 
 const ACCENT: Color = Color::Indexed(215);
 const DIM: Color = Color::Indexed(245);
@@ -44,8 +45,14 @@ const LOGO: [&str; 3] = [
 ];
 
 pub enum View<'a> {
-    Naming(&'a str),
-    Game(&'a Game, u64, &'a str),
+    Naming(&'a str, &'a str),
+    Game(&'a Game, u64, &'a str, Option<&'a Panel>),
+}
+
+/// Fiche de stats ; `stats` vide si le compte n'existe pas.
+pub struct Panel {
+    pub name: String,
+    pub stats: Option<Stats>,
 }
 
 fn fg(c: Color) -> Style {
@@ -80,9 +87,11 @@ pub fn draw(buf: &mut Buffer, view: View, now: Instant) {
     let area = Rect { x: (full.width - w) / 2, y: 1, width: w, height: full.height - 2 };
 
     match view {
-        View::Naming(name) => naming(buf, area, name),
-        View::Game(g, me, draft) => match g.phase {
+        View::Naming(name, error) => naming(buf, area, name, error),
+        View::Game(_, _, _, Some(p)) => panel(buf, area, p),
+        View::Game(g, me, draft, None) => match g.phase {
             Phase::Lobby { start_at } => lobby(buf, area, g, me, draft, start_at, now),
+            Phase::Picking { until, last } => picking(buf, area, g, me, draft, until, last, now),
             Phase::Racing { start, ends } => race(buf, area, g, me, start, ends, now),
             Phase::Results { until } => results(buf, area, g, me, draft, until, now),
         },
@@ -90,12 +99,184 @@ pub fn draw(buf: &mut Buffer, view: View, now: Instant) {
 }
 
 fn footer(buf: &mut Buffer, area: Rect, keys: &[(&str, &str)]) {
+    let keys: Vec<_> = keys.iter().chain(&[("Ctrl+C", "quitter")]).collect();
+    let len = |short: bool| -> usize {
+        keys.iter()
+            .map(|(k, l)| {
+                let k = if short { k.replace("Ctrl+", "^") } else { k.to_string() };
+                k.chars().count() + l.chars().count() + if short { 4 } else { 6 }
+            })
+            .sum()
+    };
+    let short = len(false) > area.width as usize;
     let mut spans = Vec::new();
-    for (k, label) in keys.iter().chain(&[("Ctrl+C", "quitter")]) {
+    for (k, label) in keys {
+        let k = if short { k.replace("Ctrl+", "^") } else { k.to_string() };
+        let gap = if short { " " } else { "   " };
         spans.push(Span::styled(format!(" {k} "), bold(TEXT).bg(KEY_BG)));
-        spans.push(Span::styled(format!(" {label}   "), fg(DIM)));
+        spans.push(Span::styled(format!(" {label}{gap}"), fg(DIM)));
     }
     center(buf, area, area.bottom() - 1, Line::from(spans));
+}
+
+fn team_color(t: Team) -> Color {
+    match t {
+        Team::Fox => Color::Indexed(208),
+        Team::Falco => Color::Indexed(81),
+    }
+}
+
+fn team_name(t: Team) -> &'static str {
+    match t {
+        Team::Fox => "FOX",
+        Team::Falco => "FALCO",
+    }
+}
+
+/// Score des deux équipes, avec une barre partagée entre elles.
+fn team_line(buf: &mut Buffer, area: Rect, y: u16, g: &Game, elapsed: Duration) {
+    let a = g.team_score(Team::Fox, elapsed);
+    let b = g.team_score(Team::Falco, elapsed);
+    let left = format!("FOX {a:.1} ");
+    let right = format!(" {b:.1} FALCO");
+    let bar = (area.width as usize).saturating_sub(left.len() + right.len());
+    let share = if a + b > 0.0 { a / (a + b) } else { 0.5 };
+    let filled = ((bar as f64 * share).round() as usize).min(bar);
+    let (ca, cb) = (team_color(Team::Fox), team_color(Team::Falco));
+    put(
+        buf,
+        area,
+        y,
+        Line::from(vec![
+            Span::styled(left, bold(ca)),
+            Span::styled("━".repeat(filled), fg(ca)),
+            Span::styled("━".repeat(bar - filled), fg(cb)),
+            Span::styled(right, bold(cb)),
+        ]),
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn picking(
+    buf: &mut Buffer,
+    area: Rect,
+    g: &Game,
+    me: u64,
+    draft: &str,
+    until: Instant,
+    last: bool,
+    now: Instant,
+) {
+    let left = secs_left(until, now);
+    let color = if left <= 5 { BAD } else { GOOD };
+    let y = header(buf, area, "CHOISIS TON CAMP", format!("départ dans {left}"), color) - 1;
+    let note = if last {
+        Line::styled("il faut au moins un joueur de chaque côté !", bold(BAD))
+    } else {
+        Line::styled("2 points pour gagner · 1 phrase = 1 point", fg(DIM))
+    };
+    center(buf, area, y, note);
+    let y = y + 1;
+
+    let biggest = g.players.len().max(4) + 2;
+    let height = list_rows(area, y, biggest) as u16;
+    let w = area.width / 3;
+    let mine = g.player(me).and_then(|p| p.team);
+    let columns = [(Some(Team::Fox), 0), (None, 1), (Some(Team::Falco), 2)];
+    for (team, i) in columns {
+        let width = if i == 1 { area.width - 2 * w } else { w };
+        let x = area.x + if i == 2 { area.width - w } else { i * w };
+        let rect = Rect { x, y, width, height };
+        let list: Vec<&Player> = g.players.iter().filter(|p| p.team == team && (p.ready || team.is_some())).collect();
+        let inner = match team {
+            None => {
+                let inner = Rect { y: rect.y + 1, height: rect.height.saturating_sub(1), ..rect };
+                center(buf, rect, rect.y, Line::styled(format!("◀ indécis ({}) ▶", list.len()), fg(DIM)));
+                inner
+            }
+            Some(t) => {
+                let chosen = mine == team;
+                let c = team_color(t);
+                let title = format!(" {} ({}) ", team_name(t), list.len());
+                let block = Block::bordered()
+                    .border_type(if chosen { BorderType::Thick } else { BorderType::Rounded })
+                    .border_style(fg(if chosen { c } else { HAIRLINE }))
+                    .title_top(Line::styled(title, bold(c)).centered());
+                let inner = block.inner(rect);
+                block.render(rect, buf);
+                inner
+            }
+        };
+        for (row, (_, p)) in window(&list, me, inner.height as usize).into_iter().enumerate() {
+            let style = match (p.id == me, team) {
+                (true, Some(t)) => bold(team_color(t)),
+                (true, None) => bold(ACCENT),
+                (false, Some(_)) => fg(TEXT),
+                (false, None) => fg(DIM),
+            };
+            center(buf, inner, inner.y + row as u16, Line::styled(p.name.clone(), style));
+        }
+    }
+    chat(buf, area, y + height, g, draft, now);
+    footer(buf, area, &[("←", "Fox"), ("→", "Falco")]);
+}
+
+/// Points du match, un rond par point à gagner.
+fn points_line(g: &Game) -> Line<'static> {
+    let dots = |n: u32| {
+        let full = n.min(POINTS_TO_WIN) as usize;
+        format!("{}{}", "●".repeat(full), "○".repeat(POINTS_TO_WIN as usize - full))
+    };
+    let (c, b) = (team_color(Team::Fox), team_color(Team::Falco));
+    Line::from(vec![
+        Span::styled("FOX ", bold(c)),
+        Span::styled(dots(g.teams.fox), bold(c)),
+        Span::styled(format!("  {} - {}  ", g.teams.fox, g.teams.falco), bold(TEXT)),
+        Span::styled(dots(g.teams.falco), bold(b)),
+        Span::styled(" FALCO", bold(b)),
+    ])
+}
+
+fn panel(buf: &mut Buffer, area: Rect, p: &Panel) {
+    let y = header(buf, area, &format!("PROFIL · {}", p.name), String::new(), DIM);
+    match &p.stats {
+        None => put(buf, area, y, Line::styled("Personne n'a encore couru sous ce pseudo.", fg(TEXT))),
+        Some(s) => {
+            let opt = |v: Option<u32>, unit: &str| v.map_or("-".into(), |v| format!("{v}{unit}"));
+            let rows = [
+                ("Meilleur", format!("{} mpm", s.best)),
+                ("Moyenne", opt(s.average(), " mpm")),
+                ("Précision", opt(s.accuracy(), "%")),
+                ("Courses terminées", s.races.to_string()),
+                ("Victoires", s.wins.to_string()),
+                ("Victoires en équipe", s.team_wins.to_string()),
+            ];
+            for (i, (label, value)) in rows.into_iter().enumerate() {
+                let line = Line::from(vec![
+                    Span::styled(format!("{label:<21}"), fg(DIM)),
+                    Span::styled(value, bold(TEXT)),
+                ]);
+                put(buf, area, y + i as u16, line);
+            }
+            if let (Some(min), Some(max)) = (s.history.iter().min(), s.history.iter().max()) {
+                let spark: String = s
+                    .history
+                    .iter()
+                    .map(|v| {
+                        let level = (v - min) * 7 / (max - min).max(1);
+                        ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'][level as usize]
+                    })
+                    .collect();
+                let line = Line::from(vec![
+                    Span::styled(format!("{:<21}", "Dernières courses"), fg(DIM)),
+                    Span::styled(spark, fg(ACCENT)),
+                    Span::styled(format!("  {min} à {max} mpm"), fg(DIM)),
+                ]);
+                put(buf, area, y + 7, line);
+            }
+        }
+    }
+    footer(buf, area, &[("Entrée", "fermer")]);
 }
 
 fn logo(buf: &mut Buffer, area: Rect) -> u16 {
@@ -116,19 +297,18 @@ fn rule(buf: &mut Buffer, area: Rect, y: u16) {
     put(buf, area, y, Line::styled("─".repeat(area.width as usize), fg(HAIRLINE)));
 }
 
-fn naming(buf: &mut Buffer, area: Rect, name: &str) {
+fn naming(buf: &mut Buffer, area: Rect, name: &str, error: &str) {
     let y = logo(buf, area);
     center(buf, area, y, Line::styled("course de frappe sous la cendre", fg(DIM)));
-    center(
-        buf,
-        area,
-        y + 4,
-        Line::from(vec![
-            Span::styled("Ton nom  ", fg(DIM)),
-            Span::styled(name.to_string(), bold(TEXT)),
-            Span::styled("█", fg(ACCENT)),
-        ]),
-    );
+    let line = Line::from(vec![
+        Span::styled("Ton pseudo  ", fg(DIM)),
+        Span::styled(name.to_string(), bold(TEXT)),
+        Span::styled("█", fg(ACCENT)),
+    ]);
+    center(buf, area, y + 3, line);
+    center(buf, area, y + 4, Line::styled(error.to_string(), fg(BAD)));
+    let hint = "reprends toujours le même pour garder tes stats";
+    center(buf, area, y + 6, Line::styled(hint, fg(DIM)));
     footer(buf, area, &[("Entrée", "rejoindre")]);
 }
 
@@ -206,6 +386,21 @@ fn lobby(
     let mut y = logo(buf, area);
     let ready = g.player(me).is_some_and(|p| p.ready);
     let alone = g.players.iter().filter(|p| p.ready).count() == 1 && ready;
+    let (solo, teams) = g.votes();
+    let (mode, c) = match g.next_mode() {
+        Mode::Solo => ("individuel", TEXT),
+        Mode::Teams => ("équipes", team_color(Team::Falco)),
+    };
+    let vote = match g.player(me).map(|p| p.vote) {
+        Some(Mode::Teams) => "équipes",
+        _ => "individuel",
+    };
+    let line = Line::from(vec![
+        Span::styled("Mode ", fg(DIM)),
+        Span::styled(mode, bold(c)),
+        Span::styled(format!(" ({solo} contre {teams}) · ton vote : {vote}"), fg(DIM)),
+    ]);
+    center(buf, area, y - 1, line);
     let status = match start {
         Some(t) => Line::styled(format!("Départ dans {}", secs_left(t, now)), bold(GOOD)),
         None => Line::styled("En attente d'un adversaire...", fg(DIM)),
@@ -253,7 +448,7 @@ fn lobby(
         (_, true) => "pas prêt",
         (_, false) => "prêt",
     };
-    footer(buf, area, &[("Entrée", label)]);
+    footer(buf, area, &[("Entrée", label), ("Tab", "mode"), ("Ctrl+P", "profil")]);
 }
 
 /// Coupe le texte sur les espaces ; renvoie des intervalles [début, fin).
@@ -271,9 +466,15 @@ pub fn wrap(b: &[char], width: usize) -> Vec<(usize, usize)> {
 fn race(buf: &mut Buffer, area: Rect, g: &Game, me: u64, start: Instant, ends: Instant, now: Instant) {
     let left = secs_left(ends, now);
     let ranking = g.ranking();
-    let title = format!("COURSE · {} en piste", ranking.len());
+    let title = match g.mode {
+        Mode::Solo => format!("COURSE · {} en piste", ranking.len()),
+        Mode::Teams => format!("PHRASE {}", g.teams.round),
+    };
     let color = if left <= 20 { BAD } else { DIM };
     let mut y = header(buf, area, &title, format!("{left}s"), color);
+    if g.mode == Mode::Teams {
+        center(buf, area, area.y, points_line(g));
+    }
     let mine = g.player(me).and_then(|p| p.run.as_ref());
 
     let text = g.text();
@@ -302,12 +503,20 @@ fn race(buf: &mut Buffer, area: Rect, g: &Game, me: u64, start: Instant, ends: I
     y += 1;
 
     let elapsed = now.saturating_duration_since(start);
+    if g.mode == Mode::Teams {
+        team_line(buf, area, y, g, elapsed);
+        y += 1;
+    }
     let rows = (area.bottom() - 1).saturating_sub(y) as usize;
     for (i, (rank, p)) in window(&ranking, me, rows).into_iter().enumerate() {
         let r = p.run.as_ref().unwrap();
         let bar = (area.width as usize).saturating_sub(32);
         let filled = r.pos * bar / text.len();
-        let c = if r.finish.is_some() { GOOD } else { ACCENT };
+        let c = match p.team {
+            Some(t) => team_color(t),
+            None if r.finish.is_some() => GOOD,
+            None => ACCENT,
+        };
         let line = Line::from(vec![
             Span::styled(format!("{:>2} ", rank + 1), fg(DIM)),
             Span::styled(format!("{:<17}", p.name), name_style(p, me)),
@@ -318,6 +527,7 @@ fn race(buf: &mut Buffer, area: Rect, g: &Game, me: u64, start: Instant, ends: I
         put(buf, area, y + i as u16, line);
     }
     let hint = match mine {
+        None if g.mode == Mode::Teams => "spectateur : ← → pour un camp à la fin de la phrase",
         None => "spectateur : tu cours à la prochaine",
         Some(r) if r.finish.is_some() => "arrivé ! attente des autres",
         Some(r) if r.wrong => "mauvaise touche : tape la bonne pour avancer",
@@ -335,8 +545,29 @@ fn results(
     until: Instant,
     now: Instant,
 ) {
-    let right = format!("salon dans {}", secs_left(until, now));
-    let mut y = header(buf, area, "ARRIVÉE", right, DIM);
+    let next = g.match_on();
+    let what = if next { "phrase suivante" } else { "salon" };
+    let right = format!("{what} dans {}", secs_left(until, now));
+    let title = match (g.mode, next) {
+        (Mode::Solo, _) => "ARRIVÉE",
+        (Mode::Teams, true) => "MANCHE",
+        (Mode::Teams, false) => "FIN DU MATCH",
+    };
+    let mut y = header(buf, area, title, right, DIM);
+    if g.mode == Mode::Teams {
+        center(buf, area, area.y, points_line(g));
+        let line = match (next, g.teams.round_winner, g.teams.champion) {
+            (true, Some(t), _) => Line::styled(format!("Point pour {} !", team_name(t)), bold(team_color(t))),
+            (true, None, _) => Line::styled("Manche nulle, aucun point", bold(TEXT)),
+            (false, _, Some(t)) => {
+                Line::styled(format!("★ {} remporte le match ! ★", team_name(t)), bold(team_color(t)))
+            }
+            (false, _, None) => Line::styled("Match nul", bold(TEXT)),
+        };
+        center(buf, area, y - 1, line);
+        team_line(buf, area, y, g, g.race_time);
+        y += 1;
+    }
     let head = format!("{:>2} {:<17}{:>8}{:>9}{:>10}", "#", "joueur", "mpm", "préc.", "temps");
     put(buf, area, y, Line::styled(head, fg(DIM)));
     y += 1;
@@ -350,7 +581,14 @@ fn results(
         };
         let wpm = r.wpm(g.race_time.max(Duration::from_secs(1)));
         let line = Line::from(vec![
-            Span::styled(format!("{:>2} ", rank + 1), bold(if rank == 0 { ACCENT } else { DIM })),
+            Span::styled(
+                format!("{:>2} ", rank + 1),
+                bold(match p.team {
+                    Some(t) => team_color(t),
+                    None if rank == 0 => ACCENT,
+                    None => DIM,
+                }),
+            ),
             Span::styled(format!("{:<17}", p.name), name_style(p, me)),
             Span::styled(format!("{wpm:>8}"), bold(TEXT)),
             Span::styled(format!("{:>8}%", r.accuracy()), fg(TEXT)),
@@ -359,7 +597,11 @@ fn results(
         put(buf, area, y + i as u16, line);
     }
     chat(buf, area, y + rows as u16, g, draft, now);
-    footer(buf, area, &[("Entrée", "envoyer")]);
+    if next && g.player(me).is_some_and(|p| p.team.is_none()) {
+        footer(buf, area, &[("←", "Fox"), ("→", "Falco")]);
+    } else {
+        footer(buf, area, &[("Entrée", "envoyer")]);
+    }
 }
 
 #[cfg(test)]
@@ -382,19 +624,27 @@ mod tests {
         let now = Instant::now();
         let mut g = Game::new();
         for i in 0..30 {
-            g.join(i, "ada", now);
+            g.join(i, "ada", Stats::default(), now);
+            g.toggle_vote(i);
         }
         for id in 0..30 {
             g.say(id, &"é".repeat(120), now);
         }
         for (w, h) in [(1, 1), (60, 18), (80, 24), (300, 100)] {
             let mut t = now;
-            for step in [0, 10, 130, 8] {
+            for step in [0, 30, 1, 15, 130, 8] {
                 t += Duration::from_secs(step);
                 g.tick(t);
                 let mut buf = Buffer::empty(Rect::new(0, 0, w, h));
-                draw(&mut buf, View::Game(&g, 29, &"é".repeat(120)), t);
-                draw(&mut buf, View::Naming("x"), t);
+                draw(&mut buf, View::Game(&g, 29, &"é".repeat(120), None), t);
+                draw(&mut buf, View::Naming("x", "erreur"), t);
+                let mut stats = Stats::default();
+                for wpm in [0, 80, 400] {
+                    let p = Panel { name: "x".into(), stats: Some(stats.clone()) };
+                    draw(&mut buf, View::Game(&g, 29, "", Some(&p)), t);
+                    stats.finished(wpm, 100);
+                }
+                draw(&mut buf, View::Game(&g, 29, "", Some(&Panel { name: "x".into(), stats: None })), t);
             }
         }
     }

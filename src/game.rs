@@ -1,8 +1,10 @@
 //! Logique de course. Aucune E/S : le temps est toujours passé en paramètre.
 
 use std::collections::VecDeque;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::accounts::Stats;
 use crate::phrases;
 
 pub const COUNTDOWN: Duration = Duration::from_secs(10);
@@ -15,6 +17,13 @@ pub const RESULTS: Duration = Duration::from_secs(8);
 pub const JOIN_GRACE: Duration = Duration::from_secs(5);
 /// Les arrivées ne peuvent pas repousser le départ au-delà.
 pub const MAX_COUNTDOWN: Duration = Duration::from_secs(30);
+/// Choix du camp, avant un match en équipes.
+pub const PICK: Duration = Duration::from_secs(15);
+/// Tout le monde a choisi : inutile d'attendre davantage.
+pub const PICK_DONE: Duration = Duration::from_secs(5);
+/// Points pour gagner un match (BO3), et garde-fou si des manches sont nulles.
+pub const POINTS_TO_WIN: u32 = 2;
+const MAX_ROUNDS: u32 = 5;
 pub const MAX_NAME: usize = 16;
 
 pub const MAX_RECORDS: usize = 5;
@@ -37,8 +46,44 @@ const KEY_BURST: f64 = 10.0;
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Phase {
     Lobby { start_at: Option<Instant> },
+    /// Choix des camps. `last` : prolongation déjà accordée.
+    Picking { until: Instant, last: bool },
     Racing { start: Instant, ends: Instant },
     Results { until: Instant },
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Mode {
+    Solo,
+    Teams,
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Team {
+    Fox,
+    Falco,
+}
+
+impl Team {
+    pub fn other(self) -> Team {
+        match self {
+            Team::Fox => Team::Falco,
+            Team::Falco => Team::Fox,
+        }
+    }
+}
+
+/// Match en équipes en cours.
+#[derive(Clone, Default)]
+pub struct Match {
+    pub fox: u32,
+    pub falco: u32,
+    /// Numéro de la manche en cours, à partir de 1.
+    pub round: u32,
+    /// Gagnant de la dernière manche, puis du match une fois `over`.
+    pub round_winner: Option<Team>,
+    pub champion: Option<Team>,
+    pub over: bool,
 }
 
 #[derive(Clone)]
@@ -57,6 +102,11 @@ impl Run {
         (self.pos as f64 / 5.0 * 60.0 / t).round() as u32
     }
 
+    /// A tapé au moins une touche.
+    pub fn active(&self) -> bool {
+        self.pos + self.errors > 0
+    }
+
     pub fn accuracy(&self) -> u32 {
         let total = self.pos + self.errors;
         if total == 0 { 100 } else { (self.pos * 100 / total) as u32 }
@@ -72,6 +122,11 @@ pub struct Player {
     pub ready: bool,
     pub wins: u32,
     pub run: Option<Run>,
+    pub vote: Mode,
+    pub team: Option<Team>,
+    /// A tapé pendant le match en cours.
+    played: bool,
+    pub stats: Arc<Stats>,
     chat_tokens: f64,
     last_chat: Instant,
 }
@@ -93,6 +148,11 @@ pub struct Game {
     /// Durée de la course terminée, pour l'écran de résultats.
     pub race_time: Duration,
     pub chat: VecDeque<Message>,
+    /// Mode de la course en cours ou terminée.
+    pub mode: Mode,
+    pub teams: Match,
+    /// Stats à reporter dans les comptes (voir `World::sync`).
+    pub outbox: Vec<(String, Stats)>,
     /// Textes restant à jouer avant de remélanger.
     bag: Vec<usize>,
     solo: bool,
@@ -122,6 +182,9 @@ impl Game {
             top: Vec::new(),
             race_time: Duration::ZERO,
             chat: VecDeque::new(),
+            mode: Mode::Solo,
+            teams: Match::default(),
+            outbox: Vec::new(),
             solo: false,
             latest_start: Instant::now(),
         }
@@ -135,18 +198,8 @@ impl Game {
         self.players.iter().find(|p| p.id == id)
     }
 
-    pub fn join(&mut self, id: u64, wanted: &str, now: Instant) {
-        let base = match clean_name(wanted) {
-            n if n.is_empty() => "errant".to_string(),
-            n => n,
-        };
-        let mut name = base.clone();
-        let mut n = 2;
-        while self.players.iter().any(|p| p.name.eq_ignore_ascii_case(&name)) {
-            let suffix = n.to_string();
-            name = format!("{}{suffix}", &base[..base.len().min(MAX_NAME - suffix.len())]);
-            n += 1;
-        }
+    /// Le pseudo doit être propre et libre (voir `World::join`).
+    pub fn join(&mut self, id: u64, name: &str, stats: Stats, now: Instant) {
         // Couleur la moins récemment vue dans le chat parmi celles qui sont libres.
         let color = (0..)
             .filter(|c| self.players.iter().all(|p| p.color != *c))
@@ -155,11 +208,15 @@ impl Game {
             .unwrap();
         self.players.push(Player {
             id,
-            name,
+            name: name.to_string(),
             color,
             ready: true,
             wins: 0,
             run: None,
+            vote: Mode::Solo,
+            team: None,
+            played: false,
+            stats: Arc::new(stats),
             chat_tokens: CHAT_BURST,
             last_chat: now,
         });
@@ -190,13 +247,163 @@ impl Game {
         self.tick(now);
     }
 
+    /// Change le vote du joueur pour le mode de la prochaine course.
+    pub fn toggle_vote(&mut self, id: u64) {
+        if !matches!(self.phase, Phase::Lobby { .. }) {
+            return;
+        }
+        if let Some(p) = self.players.iter_mut().find(|p| p.id == id) {
+            p.vote = if p.vote == Mode::Solo { Mode::Teams } else { Mode::Solo };
+        }
+    }
+
+    /// Votes des joueurs prêts : (chacun pour soi, équipes).
+    pub fn votes(&self) -> (usize, usize) {
+        let ready = self.players.iter().filter(|p| p.ready);
+        let (solo, teams): (Vec<_>, Vec<_>) = ready.partition(|p| p.vote == Mode::Solo);
+        (solo.len(), teams.len())
+    }
+
+    /// La majorité décide ; à égalité, chacun pour soi.
+    pub fn next_mode(&self) -> Mode {
+        let (solo, teams) = self.votes();
+        if teams > solo && solo + teams >= 2 { Mode::Teams } else { Mode::Solo }
+    }
+
+    /// Match en équipes commencé et pas encore gagné.
+    pub fn match_on(&self) -> bool {
+        self.mode == Mode::Teams
+            && !self.teams.over
+            && matches!(self.phase, Phase::Racing { .. } | Phase::Results { .. })
+    }
+
+    /// Rejoint un camp. Entre deux manches, seulement pour qui n'en a pas.
+    pub fn choose(&mut self, id: u64, team: Team, now: Instant) {
+        let picking = matches!(self.phase, Phase::Picking { .. });
+        let between = self.match_on() && matches!(self.phase, Phase::Results { .. });
+        if let Some(p) = self.players.iter_mut().find(|p| p.id == id)
+            && (picking || (between && p.team.is_none()))
+        {
+            p.team = Some(team);
+            p.ready = true;
+        }
+        self.tick(now);
+    }
+
+    pub fn team_size(&self, team: Team) -> usize {
+        self.players.iter().filter(|p| p.team == Some(team)).count()
+    }
+
+    fn empty_team(&self) -> Option<Team> {
+        [Team::Fox, Team::Falco].into_iter().find(|t| self.team_size(*t) == 0)
+    }
+
+    fn end_picking(&mut self, last: bool, now: Instant) {
+        // Les indécis complètent le camp le moins fourni.
+        for i in 0..self.players.len() {
+            if self.players[i].ready && self.players[i].team.is_none() {
+                let (c, g) = (self.team_size(Team::Fox), self.team_size(Team::Falco));
+                let fox = if c == g { rand::random() } else { c < g };
+                self.players[i].team = Some(if fox { Team::Fox } else { Team::Falco });
+            }
+        }
+        if self.empty_team().is_none() {
+            self.teams = Match::default();
+            self.start(Mode::Teams, now);
+        } else if !last {
+            self.phase = Phase::Picking { until: now + PICK, last: true };
+        } else {
+            self.clear_teams();
+            self.start(Mode::Solo, now);
+        }
+    }
+
+    fn clear_teams(&mut self) {
+        for p in &mut self.players {
+            p.team = None;
+            p.played = false;
+        }
+    }
+
+    /// Moyenne des mpm de l'équipe, sans compter les absents.
+    pub fn team_score(&self, team: Team, elapsed: Duration) -> f64 {
+        let runs = self.players.iter().filter(|p| p.team == Some(team));
+        let wpm: Vec<f64> = runs
+            .filter_map(|p| p.run.as_ref())
+            .filter(|r| r.active())
+            .map(|r| r.wpm(elapsed) as f64)
+            .collect();
+        if wpm.is_empty() { 0.0 } else { wpm.iter().sum::<f64>() / wpm.len() as f64 }
+    }
+
+    /// Modifie les stats d'un joueur et prévoit leur sauvegarde.
+    fn update_stats(&mut self, id: u64, f: impl FnOnce(&mut Stats)) {
+        if let Some(p) = self.players.iter_mut().find(|p| p.id == id) {
+            f(Arc::make_mut(&mut p.stats));
+            self.outbox.push((p.name.clone(), Stats::clone(&p.stats)));
+        }
+    }
+
+    fn end_round(&mut self) {
+        let a = self.team_score(Team::Fox, self.race_time);
+        let b = self.team_score(Team::Falco, self.race_time);
+        let mut anyone = false;
+        for p in &mut self.players {
+            if p.run.as_ref().is_some_and(Run::active) {
+                p.played = true;
+                anyone = true;
+            }
+        }
+        let m = &mut self.teams;
+        m.round_winner = match a.total_cmp(&b) {
+            std::cmp::Ordering::Equal => None,
+            std::cmp::Ordering::Greater => Some(Team::Fox),
+            std::cmp::Ordering::Less => Some(Team::Falco),
+        };
+        match m.round_winner {
+            Some(Team::Fox) => m.fox += 1,
+            Some(Team::Falco) => m.falco += 1,
+            None => {}
+        }
+        let won = m.fox.max(m.falco) >= POINTS_TO_WIN;
+        if let Some(empty) = self.empty_team() {
+            self.end_match(Some(empty.other()).filter(|t| self.team_size(*t) > 0));
+        } else if won || !anyone || self.teams.round >= MAX_ROUNDS {
+            let champion = match self.teams.fox.cmp(&self.teams.falco) {
+                std::cmp::Ordering::Equal => None,
+                std::cmp::Ordering::Greater => Some(Team::Fox),
+                std::cmp::Ordering::Less => Some(Team::Falco),
+            };
+            self.end_match(champion);
+        }
+    }
+
+    fn end_match(&mut self, champion: Option<Team>) {
+        self.teams.over = true;
+        self.teams.champion = champion;
+        let Some(champion) = champion else { return };
+        let mut ids = Vec::new();
+        for p in &mut self.players {
+            if p.team == Some(champion) && p.played {
+                p.wins += 1;
+                ids.push(p.id);
+            }
+        }
+        for id in ids {
+            self.update_stats(id, |s| s.team_wins += 1);
+        }
+    }
+
     pub fn chat_open(&self, now: Instant) -> bool {
         match self.phase {
             Phase::Lobby { start_at: None } => true,
             Phase::Lobby { start_at: Some(t) } => t.saturating_duration_since(now) > CHAT_LOCK,
             Phase::Racing { .. } => false,
+            Phase::Picking { until, .. } => until.saturating_duration_since(now) > CHAT_LOCK,
             Phase::Results { until } => {
-                until.saturating_duration_since(now) <= RESULTS - CHAT_REOPEN
+                let left = until.saturating_duration_since(now);
+                // Entre deux manches, la suivante démarre sans repasser par le salon.
+                left <= RESULTS - CHAT_REOPEN && (!self.match_on() || left > CHAT_LOCK)
             }
         }
     }
@@ -249,26 +456,28 @@ impl Game {
         if run.pos == text.len() {
             let time = now - start;
             run.finish = Some(time);
-            let (name, wpm) = (p.name.clone(), run.wpm(time));
-            let winner = self
-                .players
-                .iter()
-                .filter(|p| p.run.as_ref().is_some_and(|r| r.finish.is_some()))
-                .count()
-                == 1;
-            if winner {
+            let (wpm, accuracy) = (run.wpm(time), run.accuracy());
+            let name = p.name.clone();
+            let runs = || self.players.iter().filter_map(|p| p.run.as_ref());
+            let first = runs().filter(|r| r.finish.is_some()).count() == 1;
+            let won = first && self.mode == Mode::Solo && runs().count() > 1;
+            if first {
                 self.phase = Phase::Racing { start, ends: ends.min(now + AFTER_FIRST) };
-                if self.players.iter().filter(|p| p.run.is_some()).count() > 1 {
-                    self.players.iter_mut().find(|p| p.id == id).unwrap().wins += 1;
-                }
             }
+            if won {
+                self.players.iter_mut().find(|p| p.id == id).unwrap().wins += 1;
+            }
+            self.update_stats(id, |s| {
+                s.finished(wpm, accuracy);
+                s.wins += won as u64;
+            });
             self.record(name, wpm);
         }
         self.tick(now);
     }
 
     fn record(&mut self, name: String, wpm: u32) {
-        match self.top.iter_mut().find(|(n, _)| *n == name) {
+        match self.top.iter_mut().find(|(n, _)| n.eq_ignore_ascii_case(&name)) {
             Some(e) => e.1 = e.1.max(wpm),
             None => self.top.push((name, wpm)),
         }
@@ -296,29 +505,60 @@ impl Game {
                         self.latest_start = now + MAX_COUNTDOWN;
                         self.phase = Phase::Lobby { start_at: Some(now + wait) };
                     }
-                    Some(t) if now >= t => self.start(now),
+                    Some(t) if now >= t => match self.next_mode() {
+                        Mode::Solo => self.start(Mode::Solo, now),
+                        Mode::Teams => {
+                            self.clear_teams();
+                            self.phase = Phase::Picking { until: now + PICK, last: false };
+                        }
+                    },
                     Some(_) => {}
                 }
             }
+            Phase::Picking { until, last } => {
+                if self.ready_count() < 2 {
+                    self.clear_teams();
+                    self.phase = Phase::Lobby { start_at: None };
+                } else if now >= until {
+                    self.end_picking(last, now);
+                } else if self.empty_team().is_none()
+                    && self.players.iter().all(|p| !p.ready || p.team.is_some())
+                {
+                    self.phase = Phase::Picking { until: until.min(now + PICK_DONE), last };
+                }
+            }
             Phase::Racing { start, ends } => {
+                let forfeit = self.mode == Mode::Teams && self.empty_team().is_some();
                 let done = self
                     .players
                     .iter()
                     .filter_map(|p| p.run.as_ref())
                     .all(|r| r.finish.is_some());
-                if done || now >= ends {
+                if done || forfeit || now >= ends {
                     self.race_time = now.min(ends) - start;
                     self.phase = Phase::Results { until: now + RESULTS };
+                    if self.mode == Mode::Teams {
+                        self.end_round();
+                    }
                 }
             }
             Phase::Results { until } => {
-                if now >= until {
+                if self.match_on()
+                    && let Some(empty) = self.empty_team()
+                {
+                    // Un camp s'est vidé entre deux manches : forfait.
+                    self.end_match(Some(empty.other()).filter(|t| self.team_size(*t) > 0));
+                    self.phase = Phase::Results { until: now + RESULTS };
+                } else if now >= until && self.match_on() {
+                    self.start(Mode::Teams, now);
+                } else if now >= until {
                     for p in &mut self.players {
                         // Aucune frappe pendant la course : joueur absent.
                         if let Some(r) = p.run.take() {
-                            p.ready = r.pos + r.errors > 0;
+                            p.ready = r.active() || p.played;
                         }
                     }
+                    self.clear_teams();
                     self.solo = false;
                     self.phase = Phase::Lobby { start_at: None };
                     self.tick(now);
@@ -327,13 +567,22 @@ impl Game {
         }
     }
 
-    fn start(&mut self, now: Instant) {
+    fn start(&mut self, mode: Mode, now: Instant) {
         if self.bag.is_empty() {
             self.bag = phrases::shuffled(Some(self.text));
         }
         self.text = self.bag.pop().unwrap();
+        self.mode = mode;
+        if mode == Mode::Teams {
+            self.teams.round += 1;
+            self.teams.round_winner = None;
+        }
         for p in &mut self.players {
-            p.run = p.ready.then_some(Run {
+            let racing = match mode {
+                Mode::Solo => p.ready,
+                Mode::Teams => p.team.is_some(),
+            };
+            p.run = racing.then_some(Run {
                 pos: 0,
                 errors: 0,
                 wrong: false,
@@ -369,8 +618,8 @@ mod tests {
     fn racing() -> (Game, Instant) {
         let t = Instant::now();
         let mut g = Game::new();
-        g.join(1, "ada", t);
-        g.join(2, "bob", t);
+        g.join(1, "ada", Stats::default(), t);
+        g.join(2, "bob", Stats::default(), t);
         let t = t + COUNTDOWN;
         g.tick(t);
         assert!(matches!(g.phase, Phase::Racing { .. }));
@@ -394,10 +643,9 @@ mod tests {
     fn second_player_triggers_countdown() {
         let t = Instant::now();
         let mut g = Game::new();
-        g.join(1, "ada", t);
+        g.join(1, "ada", Stats::default(), t);
         assert_eq!(g.phase, Phase::Lobby { start_at: None });
-        g.join(2, "ada", t);
-        assert_eq!(g.players[1].name, "ada2");
+        g.join(2, "bob", Stats::default(), t);
         assert_eq!(g.phase, Phase::Lobby { start_at: Some(t + COUNTDOWN) });
         g.leave(2, t);
         assert_eq!(g.phase, Phase::Lobby { start_at: None });
@@ -407,7 +655,7 @@ mod tests {
     fn solo_start() {
         let t = Instant::now();
         let mut g = Game::new();
-        g.join(1, "ada", t);
+        g.join(1, "ada", Stats::default(), t);
         g.press_enter(1, t);
         g.tick(t + SOLO_COUNTDOWN);
         assert!(matches!(g.phase, Phase::Racing { .. }));
@@ -426,7 +674,6 @@ mod tests {
         let (mut g, t) = racing();
         let t = type_all(&mut g, 1, t);
         assert_eq!(g.player(1).unwrap().wins, 1);
-        assert_eq!(g.top[0].0, "ada");
         let Phase::Racing { ends, .. } = g.phase else { panic!() };
         assert_eq!(ends, t + AFTER_FIRST);
         g.tick(ends);
@@ -448,7 +695,7 @@ mod tests {
     #[test]
     fn late_joiner_spectates_and_leavers_end_race() {
         let (mut g, t) = racing();
-        g.join(3, "eve", t);
+        g.join(3, "eve", Stats::default(), t);
         g.key(3, 'a', t);
         assert!(g.player(3).unwrap().run.is_none());
         g.leave(1, t);
@@ -460,12 +707,12 @@ mod tests {
     fn joiners_are_added_and_extend_countdown_up_to_limit() {
         let t = Instant::now();
         let mut g = Game::new();
-        g.join(1, "a", t);
-        g.join(2, "b", t);
-        g.join(3, "c", t + secs(9));
+        g.join(1, "a", Stats::default(), t);
+        g.join(2, "b", Stats::default(), t);
+        g.join(3, "c", Stats::default(), t + secs(9));
         assert_eq!(g.phase, Phase::Lobby { start_at: Some(t + secs(14)) });
         for (i, s) in [13, 17, 21, 25].into_iter().enumerate() {
-            g.join(4 + i as u64, "d", t + secs(s));
+            g.join(4 + i as u64, "d", Stats::default(), t + secs(s));
         }
         assert_eq!(g.phase, Phase::Lobby { start_at: Some(t + MAX_COUNTDOWN) });
         g.tick(t + MAX_COUNTDOWN);
@@ -477,7 +724,7 @@ mod tests {
         let t = Instant::now();
         let mut g = Game::new();
         for id in 0..100 {
-            g.join(id, "a", t);
+            g.join(id, "a", Stats::default(), t);
         }
         g.tick(t + MAX_COUNTDOWN);
         assert_eq!(g.ranking().len(), 100);
@@ -487,8 +734,8 @@ mod tests {
     fn chat_closed_around_race_and_rate_limited() {
         let t = Instant::now();
         let mut g = Game::new();
-        g.join(1, "ada", t);
-        g.join(2, "bob", t);
+        g.join(1, "ada", Stats::default(), t);
+        g.join(2, "bob", Stats::default(), t);
         for _ in 0..4 {
             assert!(g.say(1, "h\u{1b}é\u{202e}", t));
         }
@@ -519,7 +766,7 @@ mod tests {
         let n = phrases::TEXTS.len();
         let mut seen = Vec::new();
         for _ in 0..2 * n {
-            g.start(t);
+            g.start(Mode::Solo, t);
             seen.push(g.text);
         }
         for round in seen.chunks(n) {
@@ -533,7 +780,7 @@ mod tests {
         let t = Instant::now();
         let mut g = Game::new();
         for id in 0..64 {
-            g.join(id, "a", t);
+            g.join(id, "a", Stats::default(), t);
         }
         let colors: std::collections::HashSet<_> =
             g.players[..CHAT_COLORS].iter().map(|p| p.color).collect();
@@ -545,11 +792,148 @@ mod tests {
     fn newcomer_avoids_color_of_someone_who_left() {
         let t = Instant::now();
         let mut g = Game::new();
-        g.join(1, "ada", t);
+        g.join(1, "ada", Stats::default(), t);
         g.say(1, "salut", t);
         let old = g.player(1).unwrap().color;
         g.leave(1, t);
-        g.join(2, "bob", t);
+        g.join(2, "bob", Stats::default(), t);
         assert_ne!(g.player(2).unwrap().color, old);
+    }
+
+    /// n joueurs dont les `teams` premiers votent équipes, compte à rebours écoulé.
+    fn voted(n: u64, teams: u64) -> (Game, Instant) {
+        let t = Instant::now();
+        let mut g = Game::new();
+        for id in 1..=n {
+            g.join(id, "p", Stats::default(), t);
+            if id <= teams {
+                g.toggle_vote(id);
+            }
+        }
+        let t = t + COUNTDOWN;
+        g.tick(t);
+        (g, t)
+    }
+
+    /// Match à 2 contre 2 lancé : 1 et 2 Fox, 3 et 4 Falco.
+    fn in_match() -> (Game, Instant) {
+        let (mut g, t) = voted(4, 4);
+        for id in 1..=4 {
+            g.choose(id, if id <= 2 { Team::Fox } else { Team::Falco }, t);
+        }
+        let t = t + PICK_DONE;
+        g.tick(t);
+        assert!(g.match_on());
+        (g, t)
+    }
+
+    /// `id` gagne la manche pour son camp, l'autre camp tape une touche fausse.
+    fn round(g: &mut Game, id: u64, t: Instant) -> Instant {
+        g.key(if id <= 2 { 3 } else { 1 }, '~', t + secs(1));
+        let t = type_all(g, id, t) + AFTER_FIRST;
+        g.tick(t);
+        assert!(matches!(g.phase, Phase::Results { .. }));
+        t
+    }
+
+    #[test]
+    fn majority_picks_mode() {
+        assert!(matches!(voted(4, 2).0.phase, Phase::Racing { .. }));
+        assert!(matches!(voted(4, 3).0.phase, Phase::Picking { .. }));
+    }
+
+    #[test]
+    fn players_choose_and_undecided_fill_smaller_side() {
+        let (mut g, t) = voted(5, 5);
+        for id in 1..=3 {
+            g.choose(id, Team::Fox, t);
+        }
+        g.choose(3, Team::Falco, t);
+        assert!(g.chat_open(t));
+        assert!(!g.chat_open(t + PICK - secs(2)));
+        g.tick(t + PICK);
+        assert!(g.match_on());
+        let team = |id| g.player(id).unwrap().team;
+        assert_eq!((team(1), team(2), team(3)), (Some(Team::Fox), Some(Team::Fox), Some(Team::Falco)));
+        assert!(g.team_size(Team::Fox).abs_diff(g.team_size(Team::Falco)) == 1);
+    }
+
+    #[test]
+    fn one_sided_choice_extends_once_then_goes_individual() {
+        let (mut g, t) = voted(2, 2);
+        g.choose(1, Team::Falco, t);
+        g.choose(2, Team::Falco, t);
+        g.tick(t + PICK);
+        assert!(matches!(g.phase, Phase::Picking { last: true, .. }));
+        g.tick(t + PICK * 2);
+        assert!(matches!(g.phase, Phase::Racing { .. }));
+        assert_eq!(g.mode, Mode::Solo);
+    }
+
+    #[test]
+    fn best_of_three_goes_to_decider() {
+        let (mut g, mut t) = in_match();
+        for (n, id) in [1, 3, 2].into_iter().enumerate() {
+            assert_eq!(g.teams.round, n as u32 + 1);
+            t = round(&mut g, id, t);
+            if n < 2 {
+                assert!(!g.teams.over);
+                assert!(!g.chat_open(t + RESULTS - secs(2)));
+                t += RESULTS;
+                g.tick(t);
+                assert!(matches!(g.phase, Phase::Racing { .. }));
+            }
+        }
+        assert!(g.teams.over);
+        assert_eq!((g.teams.fox, g.teams.falco, g.teams.champion), (2, 1, Some(Team::Fox)));
+        let wins = |id| g.player(id).unwrap().stats.team_wins;
+        assert_eq!((wins(1), wins(2), wins(3), wins(4)), (1, 1, 0, 0));
+        g.tick(t + RESULTS);
+        assert!(matches!(g.phase, Phase::Lobby { .. }));
+        assert!(g.players.iter().all(|p| p.team.is_none()));
+    }
+
+    #[test]
+    fn two_points_end_the_match() {
+        let (mut g, t) = in_match();
+        let t = round(&mut g, 3, t) + RESULTS;
+        g.tick(t);
+        round(&mut g, 4, t);
+        assert!(g.teams.over);
+        assert_eq!(g.teams.champion, Some(Team::Falco));
+    }
+
+    #[test]
+    fn newcomer_picks_side_between_rounds_only() {
+        let (mut g, t) = in_match();
+        g.join(9, "eve", Stats::default(), t);
+        g.choose(9, Team::Falco, t);
+        assert!(g.player(9).unwrap().team.is_none());
+        let t = round(&mut g, 1, t);
+        g.choose(9, Team::Falco, t);
+        g.choose(1, Team::Falco, t);
+        assert_eq!(g.player(1).unwrap().team, Some(Team::Fox));
+        g.tick(t + RESULTS);
+        assert!(g.player(9).unwrap().run.is_some());
+    }
+
+    #[test]
+    fn forfeit_and_abandoned_matches_end() {
+        let (mut g, t) = in_match();
+        g.key(3, '~', t + secs(1));
+        g.leave(1, t + secs(2));
+        g.leave(2, t + secs(2));
+        assert_eq!((g.teams.over, g.teams.champion), (true, Some(Team::Falco)));
+        assert_eq!(g.player(3).unwrap().stats.team_wins, 1);
+
+        let (mut g, t) = in_match();
+        let t = round(&mut g, 1, t);
+        g.leave(3, t);
+        g.leave(4, t);
+        assert_eq!((g.teams.over, g.teams.champion), (true, Some(Team::Fox)));
+
+        let (mut g, t) = in_match();
+        g.tick(t + RACE_LIMIT);
+        assert_eq!((g.teams.over, g.teams.champion), (true, None));
     }
 }
