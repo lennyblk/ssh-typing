@@ -8,7 +8,6 @@ pub enum Key {
     Quit,
     Tab,
     Profile,
-    Restart,
     Left,
     Right,
 }
@@ -71,7 +70,6 @@ impl Parser {
                         }
                         b'\r' => Key::Enter,
                         b'\t' => Key::Tab,
-                        0x12 => Key::Restart, // Ctrl+R
                         0x10 => Key::Profile, // Ctrl+P
                         8 | 0x7f => Key::Backspace,
                         0x20..=0x7e => Key::Char(b as char),

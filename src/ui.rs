@@ -130,13 +130,13 @@ fn footer(buf: &mut Buffer, area: Rect, keys: &[(&str, &str)]) {
 
 /// Pendant une partie : relance si on est seul, sinon un conseil.
 fn hint_footer(buf: &mut Buffer, area: Rect, g: &Game, hint: &str) {
-    let key = if g.alone() { ("Ctrl+R", "relancer") } else { ("···", hint) };
+    let key = if g.alone() { ("Tab", "relancer") } else { ("···", hint) };
     footer(buf, area, &[key]);
 }
 
 fn results_footer(buf: &mut Buffer, area: Rect, g: &Game) {
     if g.alone() {
-        footer(buf, area, &[("Ctrl+R", "relancer"), ("Entrée", "envoyer")]);
+        footer(buf, area, &[("Tab", "relancer"), ("Entrée", "envoyer")]);
     } else {
         footer(buf, area, &[("Entrée", "envoyer")]);
     }
