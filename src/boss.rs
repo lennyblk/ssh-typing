@@ -15,12 +15,12 @@ pub const COMBO_STEP: u32 = 5;
 pub const MAX_MULT: u32 = 3;
 
 /// Durée visée du combat pour un groupe à son niveau habituel.
-const TARGET_SECS: f64 = 75.0;
+const TARGET_SECS: f64 = 45.0;
 /// Dégâts par seconde attendus, par mpm : lettres, combo moyen, temps de parade.
-const DPS_PER_WPM: f64 = 0.088;
+const DPS_PER_WPM: f64 = 0.06;
 
 const FIRST_ATTACK: Duration = Duration::from_secs(7);
-const ENRAGE_AT: Duration = Duration::from_secs(100);
+const ENRAGE_AT: Duration = Duration::from_secs(80);
 const ENRAGE_EVERY: Duration = Duration::from_secs(5);
 const ENRAGE_DAMAGE: i32 = 8;
 const ENRAGE_STEP: i32 = 4;
@@ -62,6 +62,8 @@ pub struct Fighter {
     pub errors: u32,
     pub parry: Option<Parry>,
     pub event: Option<(Event, Instant)>,
+    /// Part des PV du boss due à ce joueur ; nulle une fois retirée.
+    share: f64,
     /// Rang du texte en cours dans `Fight::texts`.
     text: usize,
     /// Mot en cours sans faute.
@@ -115,7 +117,7 @@ impl Fight {
         let max = (power * DPS_PER_WPM * TARGET_SECS).round().max(1.0) as u32;
         let fighters = players
             .iter()
-            .map(|(id, name, _)| Fighter {
+            .map(|(id, name, level)| Fighter {
                 id: *id,
                 name: name.clone(),
                 hp: MAX_HP,
@@ -127,6 +129,7 @@ impl Fight {
                 errors: 0,
                 parry: None,
                 event: None,
+                share: (*level).clamp(20, 130) as f64 / power,
                 text: 0,
                 clean: true,
                 grace: now,
@@ -173,7 +176,20 @@ impl Fight {
         (self.start + ENRAGE_AT).saturating_duration_since(now)
     }
 
+    /// Retire du boss la part de PV d'un joueur parti ou absent.
+    fn drop_share(&mut self, id: u64) {
+        let total: f64 = self.fighters.iter().map(|f| f.share).sum();
+        let Some(f) = self.fighters.iter_mut().find(|f| f.id == id) else { return };
+        let keep = 1.0 - std::mem::take(&mut f.share) / total.max(f64::EPSILON);
+        // Dernier joueur : rien à réduire, le combat est perdu.
+        if keep > 0.01 {
+            self.hp = (self.hp as f64 * keep).ceil() as u32;
+            self.max = (self.max as f64 * keep).ceil() as u32;
+        }
+    }
+
     pub fn leave(&mut self, id: u64) {
+        self.drop_share(id);
         self.fighters.retain(|f| f.id != id);
     }
 
@@ -266,6 +282,10 @@ impl Fight {
                 f.grace = now + GRACE;
                 f.hurt(MISS_DAMAGE, Event::Missed, now);
             }
+        }
+        let absent = |f: &&Fighter| !f.alive() && !f.active() && f.share > 0.0;
+        while let Some(id) = self.fighters.iter().find(absent).map(|f| f.id) {
+            self.drop_share(id);
         }
         if now >= self.next_enrage {
             for f in self.fighters.iter_mut().filter(|f| f.alive()) {
@@ -398,7 +418,7 @@ mod tests {
                 }
             }
             assert_eq!(f.won, Some(true), "{n} joueurs");
-            assert!((35..100).contains(&f.time.as_secs()), "{n} joueurs : {:?}", f.time);
+            assert!((15..60).contains(&f.time.as_secs()), "{n} joueurs : {:?}", f.time);
         }
     }
 
@@ -409,5 +429,33 @@ mod tests {
         f.leave(2);
         f.tick(t);
         assert_eq!(f.won, Some(false));
+    }
+
+    #[test]
+    fn leaver_takes_his_share_of_boss_hp() {
+        let (mut f, _) = fight(4);
+        let (hp, max) = (f.hp, f.max);
+        f.leave(1);
+        assert_eq!((f.hp, f.max), ((hp * 3).div_ceil(4), (max * 3).div_ceil(4)));
+        f.leave(2);
+        f.leave(3);
+        let hp = f.hp;
+        f.leave(4);
+        assert_eq!(f.hp, hp);
+    }
+
+    #[test]
+    fn absent_player_stops_counting_once_down() {
+        let (mut f, mut t) = fight(2);
+        let max = f.max;
+        f.key(1, next_key(&f, 1), t);
+        f.fighters[0].damage = 1;
+        while f.fighter(2).unwrap().alive() {
+            t += ms(100);
+            f.tick(t);
+            f.fighters[0].hp = MAX_HP;
+        }
+        f.tick(t + ms(100));
+        assert!(f.max <= max / 2 + 1 && f.won.is_none());
     }
 }
