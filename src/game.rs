@@ -10,6 +10,8 @@ use crate::phrases;
 
 pub const COUNTDOWN: Duration = Duration::from_secs(10);
 pub const SOLO_COUNTDOWN: Duration = Duration::from_secs(3);
+/// Relance rapide d'un joueur seul : le temps de reposer les mains.
+pub const RESTART: Duration = Duration::from_millis(1500);
 pub const RACE_LIMIT: Duration = Duration::from_secs(120);
 /// Temps laissé aux autres après la première arrivée.
 pub const AFTER_FIRST: Duration = Duration::from_secs(20);
@@ -191,6 +193,8 @@ pub struct Game {
     /// Textes restant à jouer avant de remélanger.
     bag: Vec<usize>,
     solo: bool,
+    /// Relance rapide : le boss démarre sans réafficher les règles.
+    restarting: bool,
     /// Départ au plus tard, fixé au début du compte à rebours.
     latest_start: Instant,
 }
@@ -222,6 +226,7 @@ impl Game {
             fight: None,
             outbox: Vec::new(),
             solo: false,
+            restarting: false,
             latest_start: Instant::now(),
         }
     }
@@ -329,6 +334,7 @@ impl Game {
     }
 
     fn start_fight(&mut self, now: Instant) {
+        self.restarting = false;
         let players: Vec<_> = self
             .players
             .iter()
@@ -490,6 +496,33 @@ impl Game {
         }
     }
 
+    /// Seul connecté : peut relancer à tout moment.
+    pub fn alone(&self) -> bool {
+        self.players.len() == 1
+    }
+
+    /// Relance tout de suite la même partie, sans finir celle en cours.
+    pub fn restart(&mut self, id: u64, now: Instant) {
+        if !self.alone() || self.players[0].id != id {
+            return;
+        }
+        let in_lobby = matches!(self.phase, Phase::Lobby { .. });
+        let p = &mut self.players[0];
+        p.run = None;
+        p.ready = true;
+        if !in_lobby {
+            // Les équipes sont impossibles seul.
+            p.vote = if self.mode == Mode::Boss { Mode::Boss } else { Mode::Solo };
+        }
+        self.fight = None;
+        self.clear_teams();
+        self.solo = true;
+        // Depuis le salon, c'est une première partie : on garde les règles du boss.
+        self.restarting = !in_lobby;
+        self.latest_start = now + MAX_COUNTDOWN;
+        self.phase = Phase::Lobby { start_at: Some(now + RESTART) };
+    }
+
     pub fn chat_open(&self, now: Instant) -> bool {
         match self.phase {
             Phase::Lobby { start_at: None } => true,
@@ -608,7 +641,11 @@ impl Game {
                         Mode::Boss => {
                             self.mode = Mode::Boss;
                             self.solo = false;
-                            self.phase = Phase::Briefing { until: now + BRIEFING };
+                            if self.restarting && self.alone() {
+                                self.start_fight(now);
+                            } else {
+                                self.phase = Phase::Briefing { until: now + BRIEFING };
+                            }
                         }
                         Mode::Teams => {
                             self.clear_teams();
@@ -696,6 +733,7 @@ impl Game {
         }
         self.text = self.bag.pop().unwrap();
         self.mode = mode;
+        self.restarting = false;
         if mode == Mode::Teams {
             self.teams.round += 1;
             self.teams.round_winner = None;
@@ -1126,5 +1164,64 @@ mod tests {
         g.leave(1, t + SOLO_COUNTDOWN + BRIEFING);
         g.tick(t + secs(60));
         assert_eq!(g.phase, Phase::Lobby { start_at: None });
+    }
+
+    #[test]
+    fn alone_player_restarts_from_any_phase() {
+        let t = Instant::now();
+        let mut g = Game::new();
+        g.join(1, "a", Stats::default(), t);
+        g.restart(1, t);
+        g.tick(t + RESTART);
+        assert!(matches!(g.phase, Phase::Racing { .. }));
+        let text = g.text;
+        g.restart(1, t + secs(5));
+        g.tick(t + secs(5) + RESTART);
+        assert!(matches!(g.phase, Phase::Racing { .. }));
+        assert_ne!(g.text, text);
+        assert_eq!(g.player(1).unwrap().run.as_ref().unwrap().pos, 0);
+        let end = t + secs(7) + RACE_LIMIT;
+        g.tick(end);
+        assert!(matches!(g.phase, Phase::Results { .. }));
+        g.restart(1, end);
+        g.tick(end + RESTART);
+        assert!(matches!(g.phase, Phase::Racing { .. }));
+        assert_eq!(g.player(1).unwrap().stats.races, 0);
+    }
+
+    #[test]
+    fn boss_restart_skips_rules_only_after_first_time() {
+        let t = Instant::now();
+        let mut g = Game::new();
+        g.join(1, "a", Stats::default(), t);
+        g.cycle_vote(1, false);
+        g.restart(1, t);
+        let t = t + RESTART;
+        g.tick(t);
+        assert!(matches!(g.phase, Phase::Briefing { .. }));
+        g.tick(t + BRIEFING);
+        assert_eq!(g.phase, Phase::Boss);
+        g.key(1, '~', t + BRIEFING + secs(1));
+        let t = t + BRIEFING + secs(2);
+        g.restart(1, t);
+        g.tick(t + RESTART);
+        assert_eq!(g.phase, Phase::Boss);
+        let f = g.fight.as_ref().unwrap();
+        assert_eq!((f.hp, f.fighters[0].hp), (f.max, crate::boss::MAX_HP));
+        assert_eq!(g.player(1).unwrap().stats.boss_fights, 0);
+    }
+
+    #[test]
+    fn restart_refused_with_others_and_cancelled_speed_when_someone_joins() {
+        let (mut g, t) = racing();
+        let before = g.phase;
+        g.restart(1, t);
+        assert_eq!(g.phase, before);
+
+        let mut g = Game::new();
+        g.join(1, "a", Stats::default(), t);
+        g.restart(1, t);
+        g.join(2, "b", Stats::default(), t + secs(1));
+        assert_eq!(g.phase, Phase::Lobby { start_at: Some(t + secs(1) + JOIN_GRACE) });
     }
 }

@@ -184,6 +184,10 @@ async fn play(
                             }
                             (_, None) => {}
                             (Key::Tab, Some(_)) => lock(&game).game.cycle_vote(id, true),
+                            (Key::Restart, Some(_)) => {
+                                panel = None;
+                                lock(&game).game.restart(id, Instant::now());
+                            }
                             (Key::Left, Some(_)) => lock(&game).game.arrow(id, false, Instant::now()),
                             (Key::Right, Some(_)) => lock(&game).game.arrow(id, true, Instant::now()),
                             (Key::Profile, Some(_)) => {

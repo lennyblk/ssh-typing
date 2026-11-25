@@ -128,6 +128,20 @@ fn footer(buf: &mut Buffer, area: Rect, keys: &[(&str, &str)]) {
     center(buf, area, area.bottom() - 1, Line::from(spans));
 }
 
+/// Pendant une partie : relance si on est seul, sinon un conseil.
+fn hint_footer(buf: &mut Buffer, area: Rect, g: &Game, hint: &str) {
+    let key = if g.alone() { ("Ctrl+R", "relancer") } else { ("···", hint) };
+    footer(buf, area, &[key]);
+}
+
+fn results_footer(buf: &mut Buffer, area: Rect, g: &Game) {
+    if g.alone() {
+        footer(buf, area, &[("Ctrl+R", "relancer"), ("Entrée", "envoyer")]);
+    } else {
+        footer(buf, area, &[("Entrée", "envoyer")]);
+    }
+}
+
 fn team_color(t: Team) -> Color {
     match t {
         Team::Fox => Color::Indexed(208),
@@ -572,7 +586,7 @@ fn race(buf: &mut Buffer, area: Rect, g: &Game, me: u64, start: Instant, ends: I
         Some(r) if r.wrong => "mauvaise touche : tape la bonne pour avancer",
         Some(_) => "tape le texte",
     };
-    footer(buf, area, &[("···", hint)]);
+    hint_footer(buf, area, g, hint);
 }
 
 fn results(
@@ -639,7 +653,7 @@ fn results(
     if next && g.player(me).is_some_and(|p| p.team.is_none()) {
         footer(buf, area, &[("←", "Fox"), ("→", "Falco")]);
     } else {
-        footer(buf, area, &[("Entrée", "envoyer")]);
+        results_footer(buf, area, g);
     }
 }
 
@@ -846,7 +860,7 @@ fn boss_fight(buf: &mut Buffer, area: Rect, g: &Game, me: u64, now: Instant) {
         (Some(m), None) if m.alive() => "chaque mot frappe le boss",
         _ => "regarde le combat",
     };
-    footer(buf, area, &[("···", hint)]);
+    hint_footer(buf, area, g, hint);
 }
 
 fn event_line(m: &Fighter, now: Instant) -> Line<'static> {
@@ -900,7 +914,7 @@ fn boss_results(buf: &mut Buffer, area: Rect, g: &Game, me: u64, draft: &str, un
         put(buf, area, y + i as u16, line);
     }
     chat(buf, area, y + rows as u16, g, draft, now);
-    footer(buf, area, &[("Entrée", "envoyer")]);
+    results_footer(buf, area, g);
 }
 
 #[cfg(test)]
