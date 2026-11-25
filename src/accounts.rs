@@ -16,6 +16,10 @@ pub struct Stats {
     pub races: u64,
     pub wins: u64,
     pub team_wins: u64,
+    pub boss_fights: u64,
+    pub boss_wins: u64,
+    /// Victoire la plus rapide contre le boss, en secondes ; 0 si aucune.
+    pub boss_best: u32,
     pub best: u32,
     total_wpm: u64,
     total_accuracy: u64,

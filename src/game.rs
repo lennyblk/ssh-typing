@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::accounts::Stats;
+use crate::boss::Fight;
 use crate::phrases;
 
 pub const COUNTDOWN: Duration = Duration::from_secs(10);
@@ -17,6 +18,8 @@ pub const RESULTS: Duration = Duration::from_secs(8);
 pub const JOIN_GRACE: Duration = Duration::from_secs(5);
 /// Les arrivées ne peuvent pas repousser le départ au-delà.
 pub const MAX_COUNTDOWN: Duration = Duration::from_secs(30);
+/// Lecture des règles avant le boss.
+pub const BRIEFING: Duration = Duration::from_secs(7);
 /// Choix du camp, avant un match en équipes.
 pub const PICK: Duration = Duration::from_secs(15);
 /// Tout le monde a choisi : inutile d'attendre davantage.
@@ -49,13 +52,44 @@ pub enum Phase {
     /// Choix des camps. `last` : prolongation déjà accordée.
     Picking { until: Instant, last: bool },
     Racing { start: Instant, ends: Instant },
+    Briefing { until: Instant },
+    Boss,
     Results { until: Instant },
+}
+
+/// Plafond de vitesse de frappe, contre le collage.
+#[derive(Clone)]
+pub struct Throttle {
+    tokens: f64,
+    last: Instant,
+}
+
+impl Throttle {
+    pub fn new(now: Instant) -> Self {
+        Throttle { tokens: KEY_BURST, last: now }
+    }
+
+    pub fn allow(&mut self, now: Instant) -> bool {
+        let dt = now.saturating_duration_since(self.last).as_secs_f64();
+        self.last = now;
+        self.tokens = (self.tokens + dt * KEYS_PER_SEC).min(KEY_BURST);
+        let ok = self.tokens >= 1.0;
+        if ok {
+            self.tokens -= 1.0;
+        }
+        ok
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Mode {
     Solo,
     Teams,
+    Boss,
+}
+
+impl Mode {
+    pub const ALL: [Mode; 3] = [Mode::Solo, Mode::Teams, Mode::Boss];
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -92,8 +126,7 @@ pub struct Run {
     pub errors: usize,
     pub wrong: bool,
     pub finish: Option<Duration>,
-    tokens: f64,
-    last_key: Instant,
+    keys: Throttle,
 }
 
 impl Run {
@@ -151,6 +184,8 @@ pub struct Game {
     /// Mode de la course en cours ou terminée.
     pub mode: Mode,
     pub teams: Match,
+    /// Combat en cours, ou terminé pendant l'écran de résultats.
+    pub fight: Option<Fight>,
     /// Stats à reporter dans les comptes (voir `World::sync`).
     pub outbox: Vec<(String, Stats)>,
     /// Textes restant à jouer avant de remélanger.
@@ -184,6 +219,7 @@ impl Game {
             chat: VecDeque::new(),
             mode: Mode::Solo,
             teams: Match::default(),
+            fight: None,
             outbox: Vec::new(),
             solo: false,
             latest_start: Instant::now(),
@@ -229,6 +265,12 @@ impl Game {
 
     pub fn leave(&mut self, id: u64, now: Instant) {
         self.players.retain(|p| p.id != id);
+        // Après le combat, la fiche reste pour l'écran de résultats.
+        if self.phase == Phase::Boss
+            && let Some(f) = &mut self.fight
+        {
+            f.leave(id);
+        }
         self.tick(now);
     }
 
@@ -247,37 +289,81 @@ impl Game {
         self.tick(now);
     }
 
-    /// Change le vote du joueur pour le mode de la prochaine course.
-    pub fn toggle_vote(&mut self, id: u64) {
+    /// Vote suivant (ou précédent) pour le mode de la prochaine partie.
+    pub fn cycle_vote(&mut self, id: u64, forward: bool) {
         if !matches!(self.phase, Phase::Lobby { .. }) {
             return;
         }
         if let Some(p) = self.players.iter_mut().find(|p| p.id == id) {
-            p.vote = if p.vote == Mode::Solo { Mode::Teams } else { Mode::Solo };
+            let n = Mode::ALL.len();
+            let step = if forward { 1 } else { n - 1 };
+            p.vote = Mode::ALL[(p.vote as usize + step) % n];
         }
     }
 
     /// Flèche gauche ou droite : mode dans le salon, camp ailleurs.
     pub fn arrow(&mut self, id: u64, right: bool, now: Instant) {
-        if !matches!(self.phase, Phase::Lobby { .. }) {
-            return self.choose(id, if right { Team::Falco } else { Team::Fox }, now);
-        }
-        if let Some(p) = self.players.iter_mut().find(|p| p.id == id) {
-            p.vote = if right { Mode::Teams } else { Mode::Solo };
+        if matches!(self.phase, Phase::Lobby { .. }) {
+            self.cycle_vote(id, right);
+        } else {
+            self.choose(id, if right { Team::Falco } else { Team::Fox }, now);
         }
     }
 
-    /// Votes des joueurs prêts : (chacun pour soi, équipes).
-    pub fn votes(&self) -> (usize, usize) {
-        let ready = self.players.iter().filter(|p| p.ready);
-        let (solo, teams): (Vec<_>, Vec<_>) = ready.partition(|p| p.vote == Mode::Solo);
-        (solo.len(), teams.len())
+    /// Votes des joueurs prêts, dans l'ordre de `Mode::ALL`.
+    pub fn votes(&self) -> [usize; 3] {
+        let mut votes = [0; 3];
+        for p in self.players.iter().filter(|p| p.ready) {
+            votes[p.vote as usize] += 1;
+        }
+        votes
     }
 
-    /// La majorité décide ; à égalité, chacun pour soi.
+    /// Le plus voté l'emporte ; à égalité, le premier de `Mode::ALL`.
     pub fn next_mode(&self) -> Mode {
-        let (solo, teams) = self.votes();
-        if teams > solo && solo + teams >= 2 { Mode::Teams } else { Mode::Solo }
+        let votes = self.votes();
+        let possible = |m: &Mode| *m != Mode::Teams || self.ready_count() >= 2;
+        let modes = Mode::ALL.into_iter().filter(possible);
+        // min_by_key garde le premier en cas d'égalité.
+        modes.min_by_key(|m| std::cmp::Reverse(votes[*m as usize])).unwrap_or(Mode::Solo)
+    }
+
+    fn start_fight(&mut self, now: Instant) {
+        let players: Vec<_> = self
+            .players
+            .iter()
+            .filter(|p| p.ready)
+            .map(|p| {
+                let level = match (p.stats.average(), p.stats.best) {
+                    (Some(avg), _) => avg,
+                    (None, 0) => 55,
+                    (None, best) => best * 4 / 5,
+                };
+                (p.id, p.name.clone(), level)
+            })
+            .collect();
+        self.fight = Some(Fight::new(&players, now));
+        self.phase = Phase::Boss;
+    }
+
+    fn end_fight(&mut self, now: Instant) {
+        let Some(fight) = &self.fight else { return };
+        let won = fight.won == Some(true);
+        let secs = fight.time.as_secs().max(1) as u32;
+        let ids: Vec<u64> = fight.fighters.iter().filter(|f| f.active()).map(|f| f.id).collect();
+        for id in ids {
+            self.update_stats(id, |s| {
+                s.boss_fights += 1;
+                if won {
+                    s.boss_wins += 1;
+                    s.boss_best = if s.boss_best == 0 { secs } else { s.boss_best.min(secs) };
+                }
+            });
+            if won && let Some(p) = self.players.iter_mut().find(|p| p.id == id) {
+                p.wins += 1;
+            }
+        }
+        self.phase = Phase::Results { until: now + RESULTS };
     }
 
     /// Match en équipes commencé et pas encore gagné.
@@ -408,7 +494,7 @@ impl Game {
         match self.phase {
             Phase::Lobby { start_at: None } => true,
             Phase::Lobby { start_at: Some(t) } => t.saturating_duration_since(now) > CHAT_LOCK,
-            Phase::Racing { .. } => false,
+            Phase::Racing { .. } | Phase::Briefing { .. } | Phase::Boss => false,
             Phase::Picking { until, .. } => until.saturating_duration_since(now) > CHAT_LOCK,
             Phase::Results { until } => {
                 let left = until.saturating_duration_since(now);
@@ -440,6 +526,12 @@ impl Game {
     }
 
     pub fn key(&mut self, id: u64, c: char, now: Instant) {
+        if self.phase == Phase::Boss {
+            if let Some(f) = &mut self.fight {
+                f.key(id, c, now);
+            }
+            return self.tick(now);
+        }
         let Phase::Racing { start, ends } = self.phase else { return };
         if now >= ends {
             return;
@@ -448,13 +540,9 @@ impl Game {
         let Some(p) = self.players.iter_mut().find(|p| p.id == id) else { return };
         let Some(run) = p.run.as_mut().filter(|r| r.finish.is_none()) else { return };
 
-        let dt = now.saturating_duration_since(run.last_key).as_secs_f64();
-        run.last_key = now;
-        run.tokens = (run.tokens + dt * KEYS_PER_SEC).min(KEY_BURST);
-        if run.tokens < 1.0 {
+        if !run.keys.allow(now) {
             return;
         }
-        run.tokens -= 1.0;
 
         if text[run.pos] as char != c {
             run.errors += 1;
@@ -517,6 +605,11 @@ impl Game {
                     }
                     Some(t) if now >= t => match self.next_mode() {
                         Mode::Solo => self.start(Mode::Solo, now),
+                        Mode::Boss => {
+                            self.mode = Mode::Boss;
+                            self.solo = false;
+                            self.phase = Phase::Briefing { until: now + BRIEFING };
+                        }
                         Mode::Teams => {
                             self.clear_teams();
                             self.phase = Phase::Picking { until: now + PICK, last: false };
@@ -535,6 +628,22 @@ impl Game {
                     && self.players.iter().all(|p| !p.ready || p.team.is_some())
                 {
                     self.phase = Phase::Picking { until: until.min(now + PICK_DONE), last };
+                }
+            }
+            Phase::Briefing { until } => {
+                if self.ready_count() == 0 {
+                    self.phase = Phase::Lobby { start_at: None };
+                } else if now >= until {
+                    self.start_fight(now);
+                }
+            }
+            Phase::Boss => {
+                let over = self.fight.as_mut().is_none_or(|f| {
+                    f.tick(now);
+                    f.won.is_some()
+                });
+                if over {
+                    self.end_fight(now);
                 }
             }
             Phase::Racing { start, ends } => {
@@ -562,7 +671,11 @@ impl Game {
                 } else if now >= until && self.match_on() {
                     self.start(Mode::Teams, now);
                 } else if now >= until {
+                    let fight = self.fight.take();
                     for p in &mut self.players {
+                        if let Some(f) = fight.as_ref().and_then(|f| f.fighter(p.id)) {
+                            p.ready = f.active();
+                        }
                         // Aucune frappe pendant la course : joueur absent.
                         if let Some(r) = p.run.take() {
                             p.ready = r.active() || p.played;
@@ -591,14 +704,14 @@ impl Game {
             let racing = match mode {
                 Mode::Solo => p.ready,
                 Mode::Teams => p.team.is_some(),
+                Mode::Boss => false, // voir `start_fight`
             };
             p.run = racing.then_some(Run {
                 pos: 0,
                 errors: 0,
                 wrong: false,
                 finish: None,
-                tokens: KEY_BURST,
-                last_key: now,
+                keys: Throttle::new(now),
             });
         }
         self.solo = false;
@@ -817,7 +930,7 @@ mod tests {
         for id in 1..=n {
             g.join(id, "p", Stats::default(), t);
             if id <= teams {
-                g.toggle_vote(id);
+                g.cycle_vote(id, true);
             }
         }
         let t = t + COUNTDOWN;
@@ -852,9 +965,12 @@ mod tests {
         let mut g = Game::new();
         g.join(1, "p", Stats::default(), t);
         g.arrow(1, true, t);
-        assert_eq!(g.votes(), (0, 1));
+        assert_eq!(g.votes(), [0, 1, 0]);
         g.arrow(1, false, t);
-        assert_eq!(g.votes(), (1, 0));
+        assert_eq!(g.votes(), [1, 0, 0]);
+        g.arrow(1, false, t);
+        assert_eq!(g.votes(), [0, 0, 1]);
+        assert_eq!(g.next_mode(), Mode::Boss);
         assert!(g.player(1).unwrap().team.is_none());
     }
 
@@ -957,5 +1073,58 @@ mod tests {
         let (mut g, t) = in_match();
         g.tick(t + RACE_LIMIT);
         assert_eq!((g.teams.over, g.teams.champion), (true, None));
+    }
+
+    #[test]
+    fn boss_fight_from_lobby_to_stats() {
+        for win in [true, false] {
+            let t = Instant::now();
+            let mut g = Game::new();
+            for (id, name) in [(1, "a"), (2, "b")] {
+                g.join(id, name, Stats::default(), t);
+                g.cycle_vote(id, false);
+            }
+            let mut t = t + COUNTDOWN;
+            g.tick(t);
+            assert!(matches!(g.phase, Phase::Briefing { .. }));
+            assert!(!g.chat_open(t));
+            t += BRIEFING;
+            g.tick(t);
+            assert_eq!(g.phase, Phase::Boss);
+            g.join(3, "eve", Stats::default(), t);
+            g.key(3, 'a', t);
+            // 1 se bat, 2 est absent.
+            g.key(1, '~', t + secs(1));
+            if win {
+                g.fight.as_mut().unwrap().hp = 0;
+            }
+            while g.phase == Phase::Boss {
+                t += secs(1);
+                g.tick(t);
+            }
+            let s = |id| g.player(id).unwrap().stats.clone();
+            assert_eq!((s(1).boss_fights, s(1).boss_wins), (1, win as u64));
+            assert_eq!((s(2).boss_fights, s(3).boss_fights), (0, 0));
+            assert_eq!(s(1).races, 0);
+            g.tick(t + RESULTS);
+            assert!(matches!(g.phase, Phase::Lobby { .. }));
+            assert!(g.fight.is_none());
+            assert_eq!((g.player(1).unwrap().ready, g.player(2).unwrap().ready), (true, false));
+        }
+    }
+
+    #[test]
+    fn everyone_leaving_boss_returns_to_lobby() {
+        let t = Instant::now();
+        let mut g = Game::new();
+        g.join(1, "a", Stats::default(), t);
+        g.cycle_vote(1, false);
+        g.press_enter(1, t);
+        g.tick(t + SOLO_COUNTDOWN);
+        g.tick(t + SOLO_COUNTDOWN + BRIEFING);
+        assert_eq!(g.phase, Phase::Boss);
+        g.leave(1, t + SOLO_COUNTDOWN + BRIEFING);
+        g.tick(t + secs(60));
+        assert_eq!(g.phase, Phase::Lobby { start_at: None });
     }
 }

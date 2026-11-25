@@ -183,7 +183,7 @@ async fn play(
                                 }
                             }
                             (_, None) => {}
-                            (Key::Tab, Some(_)) => lock(&game).game.toggle_vote(id),
+                            (Key::Tab, Some(_)) => lock(&game).game.cycle_vote(id, true),
                             (Key::Left, Some(_)) => lock(&game).game.arrow(id, false, Instant::now()),
                             (Key::Right, Some(_)) => lock(&game).game.arrow(id, true, Instant::now()),
                             (Key::Profile, Some(_)) => {
@@ -254,7 +254,7 @@ async fn play(
 
         let out = if seat.is_some() {
             let snapshot = lock(&game).game.clone();
-            if matches!(snapshot.phase, Phase::Racing { .. } | Phase::Picking { .. }) {
+            if matches!(snapshot.phase, Phase::Racing { .. } | Phase::Picking { .. } | Phase::Briefing { .. } | Phase::Boss) {
                 panel = None;
             }
             screen.frame(View::Game(&snapshot, id, &draft, panel.as_ref()))?

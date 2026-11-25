@@ -11,6 +11,7 @@ use ratatui::{
 };
 
 use crate::accounts::Stats;
+use crate::boss::{self, Event, Fight, Fighter};
 use crate::game::{CHAT_COLORS, Game, Mode, POINTS_TO_WIN, Phase, Player, Team};
 
 const ACCENT: Color = Color::Indexed(215);
@@ -22,6 +23,7 @@ const TEXT: Color = Color::Indexed(252);
 const GOOD: Color = Color::Indexed(114);
 const MODE_SOLO: Color = Color::Indexed(186);
 const MODE_TEAMS: Color = Color::Indexed(177);
+const MODE_BOSS: Color = Color::Indexed(167);
 const BAD: Color = Color::Indexed(203);
 
 /// Une couleur par personne dans le chat, les plus contrastées d'abord.
@@ -95,6 +97,11 @@ pub fn draw(buf: &mut Buffer, view: View, now: Instant) {
             Phase::Lobby { start_at } => lobby(buf, area, g, me, draft, start_at, now),
             Phase::Picking { until, last } => picking(buf, area, g, me, draft, until, last, now),
             Phase::Racing { start, ends } => race(buf, area, g, me, start, ends, now),
+            Phase::Briefing { until } => briefing(buf, area, until, now),
+            Phase::Boss => boss_fight(buf, area, g, me, now),
+            Phase::Results { until } if g.mode == Mode::Boss => {
+                boss_results(buf, area, g, me, draft, until, now)
+            }
             Phase::Results { until } => results(buf, area, g, me, draft, until, now),
         },
     }
@@ -252,6 +259,11 @@ fn panel(buf: &mut Buffer, area: Rect, p: &Panel) {
                 ("Courses terminées", s.races.to_string()),
                 ("Victoires", s.wins.to_string()),
                 ("Victoires en équipe", s.team_wins.to_string()),
+                ("Boss vaincus", format!("{} sur {}", s.boss_wins, s.boss_fights)),
+                ("Boss le plus rapide", match s.boss_best {
+                    0 => "-".into(),
+                    n => format!("{n}s"),
+                }),
             ];
             for (i, (label, value)) in rows.into_iter().enumerate() {
                 let line = Line::from(vec![
@@ -274,7 +286,7 @@ fn panel(buf: &mut Buffer, area: Rect, p: &Panel) {
                     Span::styled(spark, fg(ACCENT)),
                     Span::styled(format!("  {min} à {max} mpm"), fg(DIM)),
                 ]);
-                put(buf, area, y + 7, line);
+                put(buf, area, y + 9, line);
             }
         }
     }
@@ -376,17 +388,21 @@ fn chat(buf: &mut Buffer, area: Rect, y: u16, g: &Game, draft: &str, now: Instan
     put(buf, area, input, line);
 }
 
-/// Les deux modes côte à côte : celui qui l'emporte est plein, l'autre éteint.
+/// Les modes côte à côte : celui qui l'emporte est plein, les autres éteints.
 fn mode_cards(buf: &mut Buffer, area: Rect, g: &Game, me: u64) {
-    let (solo, teams) = g.votes();
+    let votes = g.votes();
     let mine = g.player(me).map(|p| p.vote);
-    let half = area.width / 2;
+    let third = area.width / 3;
     let cards = [
-        (Mode::Solo, "INDIVIDUEL", solo, MODE_SOLO, 0),
-        (Mode::Teams, "ÉQUIPES", teams, MODE_TEAMS, half),
+        (Mode::Solo, "INDIVIDUEL", MODE_SOLO),
+        (Mode::Teams, "ÉQUIPES", MODE_TEAMS),
+        (Mode::Boss, "BOSS", MODE_BOSS),
     ];
-    for (mode, label, votes, color, dx) in cards {
-        let rect = Rect { x: area.x + dx, width: half, ..area };
+    for (i, (mode, label, color)) in cards.into_iter().enumerate() {
+        let votes = votes[mode as usize];
+        let x = area.x + i as u16 * third;
+        let width = if i == 2 { area.right() - x } else { third };
+        let rect = Rect { x, width, ..area };
         let leads = g.next_mode() == mode;
         let border = if leads { BorderType::Thick } else { BorderType::Rounded };
         let mut block = Block::bordered()
@@ -400,12 +416,11 @@ fn mode_cards(buf: &mut Buffer, area: Rect, g: &Game, me: u64) {
         }
         let inner = block.inner(rect);
         block.render(rect, buf);
-        let s = if votes > 1 { "s" } else { "" };
         let style = if leads { Style::new().fg(Color::Indexed(234)).bg(color) } else { fg(color) };
         if leads {
             buf.set_style(inner, style);
         }
-        let text = format!("{label}  ·  {votes} vote{s}");
+        let text = format!("{label} · {votes}");
         center(buf, inner, inner.y, Line::styled(text, style.add_modifier(Modifier::BOLD)));
     }
 }
@@ -468,7 +483,7 @@ fn lobby(
     chat(buf, area, y + rows as u16, g, draft, now);
     let label = match (alone && start.is_none(), ready) {
         _ if !draft.trim().is_empty() => "envoyer",
-        (true, _) => "courir seul",
+        (true, _) => "jouer seul",
         (_, true) => "pas prêt",
         (_, false) => "prêt",
     };
@@ -492,7 +507,7 @@ fn race(buf: &mut Buffer, area: Rect, g: &Game, me: u64, start: Instant, ends: I
     let ranking = g.ranking();
     let title = match g.mode {
         Mode::Solo => format!("COURSE · {} en piste", ranking.len()),
-        Mode::Teams => format!("PHRASE {}", g.teams.round),
+        _ => format!("PHRASE {}", g.teams.round),
     };
     let color = if left <= 20 { BAD } else { DIM };
     let mut y = header(buf, area, &title, format!("{left}s"), color);
@@ -574,8 +589,8 @@ fn results(
     let right = format!("{what} dans {}", secs_left(until, now));
     let title = match (g.mode, next) {
         (Mode::Solo, _) => "ARRIVÉE",
-        (Mode::Teams, true) => "MANCHE",
-        (Mode::Teams, false) => "FIN DU MATCH",
+        (_, true) => "MANCHE",
+        (_, false) => "FIN DU MATCH",
     };
     let mut y = header(buf, area, title, right, DIM);
     if g.mode == Mode::Teams {
@@ -628,6 +643,266 @@ fn results(
     }
 }
 
+// ─── BOSS ────────────────────────────────────────────────────────────────────
+
+const INK: Color = Color::Indexed(234);
+const GO: Color = Color::Indexed(71);
+const WARN: Color = Color::Indexed(179);
+const DANGER: Color = Color::Indexed(160);
+
+/// `@` : yeux, d'une autre couleur.
+const COLOSSUS: [&str; 6] = [
+    "      ▄▄██████████▄▄      ",
+    "   ▄██████████████████▄   ",
+    "  ████  @@@████@@@  ████  ",
+    "  █████▄   ████   ▄█████  ",
+    "   ▀███▄▀▄▀▄▀▄▀▄▀▄▀███▀   ",
+    " ▄███▀▀████████████▀▀███▄ ",
+];
+
+/// Consigne du moment : trois lignes pleines, impossibles à rater.
+fn banner(buf: &mut Buffer, area: Rect, y: u16, text: &str, color: Color, ink: Color) {
+    let rect = Rect { y, height: 3, ..area }.intersection(area);
+    buf.set_style(rect, Style::new().bg(color));
+    center(buf, area, y + 1, Line::styled(text.to_string(), bold(ink).bg(color)));
+}
+
+fn gauge(value: u32, max: u32, width: usize, color: Color) -> [Span<'static>; 2] {
+    let mut full = (value as usize * width).div_ceil(max.max(1) as usize).min(width);
+    if value == 0 {
+        full = 0;
+    }
+    [Span::styled("█".repeat(full), fg(color)), Span::styled("░".repeat(width - full), fg(TRACK))]
+}
+
+fn hp_color(hp: i32) -> Color {
+    match hp {
+        60.. => GOOD,
+        30.. => Color::Indexed(220),
+        _ => BAD,
+    }
+}
+
+fn stage_color(stage: u32) -> Color {
+    [Color::Indexed(141), Color::Indexed(208), Color::Indexed(196)][stage as usize - 1]
+}
+
+fn briefing(buf: &mut Buffer, area: Rect, until: Instant, now: Instant) {
+    let right = format!("combat dans {}", secs_left(until, now));
+    let y = header(buf, area, boss::NAME, right, BAD) - 1;
+    let white = Color::Indexed(231);
+    let rules = [
+        (GO, "TAPE LA PHRASE  =  TU FRAPPES   (mots parfaits : x2, x3)".to_string()),
+        (WARN, format!("FAUTE DE FRAPPE  =  -{} PV ET COMBO PERDU", boss::FAULT_DAMAGE)),
+        (DANGER, format!("MOT ROUGE  =  TAPE-LE VITE, SINON -{} PV", boss::MISS_DAMAGE)),
+    ];
+    for (i, (color, text)) in rules.iter().enumerate() {
+        let ink = if *color == DANGER { white } else { INK };
+        banner(buf, area, y + i as u16 * 3, text, *color, ink);
+    }
+    let last = "0 PV : à terre. Battez-le ensemble avant l'enrage !";
+    center(buf, area, y + 10, Line::styled(last, bold(TEXT)));
+    footer(buf, area, &[("···", "lis vite, ça arrive")]);
+}
+
+fn boss_fight(buf: &mut Buffer, area: Rect, g: &Game, me: u64, now: Instant) {
+    let Some(f) = &g.fight else { return };
+    let mine = f.fighter(me);
+    let parry = mine.and_then(|m| m.parry.as_ref());
+    let stage = stage_color(f.stage());
+    let white = Color::Indexed(231);
+
+    // Boss : nom, enrage, vie.
+    let enrage = f.enrage_in(now).as_secs();
+    let (timer, c) = match enrage {
+        0 => ("ENRAGÉ !".to_string(), BAD),
+        n => (format!("enrage dans {n}s"), if n <= 20 { BAD } else { DIM }),
+    };
+    let title = format!("{} · phase {}/3", boss::NAME, f.stage());
+    put(buf, area, area.y, Line::styled(title, bold(stage)));
+    put(buf, area, area.y, Line::styled(timer, bold(c)).right_aligned());
+    let label = format!(" {:>3}%", (f.hp as u64 * 100).div_ceil(f.max as u64));
+    let mut bar = gauge(f.hp, f.max, area.width as usize - label.len(), stage).to_vec();
+    bar.push(Span::styled(label, bold(stage)));
+    put(buf, area, area.y + 1, Line::from(bar));
+    let mut y = area.y + 2;
+
+    if area.height >= 22 {
+        let eyes = if f.attacking() { Color::Indexed(196) } else { Color::Indexed(228) };
+        for row in COLOSSUS {
+            let spans: Vec<Span> = row
+                .chars()
+                .map(|c| match c {
+                    '@' => Span::styled("█", fg(eyes)),
+                    c => Span::styled(c.to_string(), fg(stage)),
+                })
+                .collect();
+            center(buf, area, y, Line::from(spans));
+            y += 1;
+        }
+    }
+
+    // Consigne.
+    match (mine, parry) {
+        (None, _) => banner(buf, area, y, "SPECTATEUR : tu joues à la prochaine", TRACK, TEXT),
+        (Some(m), _) if !m.alive() => {
+            banner(buf, area, y, "À TERRE ! Tes alliés continuent", TRACK, BAD)
+        }
+        (Some(_), Some(p)) => {
+            let text = format!("▶▶▶  PARE ! TAPE « {} »  ◀◀◀", p.word.to_uppercase());
+            banner(buf, area, y, &text, DANGER, white);
+        }
+        (Some(m), None) if m.mult() > 1 => {
+            let text = format!("FRAPPE ! TAPE LA PHRASE   COMBO x{}", m.mult());
+            banner(buf, area, y, &text, if m.mult() == 2 { GO } else { Color::Indexed(214) }, INK);
+        }
+        (Some(_), None) => banner(buf, area, y, "FRAPPE ! TAPE LA PHRASE", GO, INK),
+    }
+    y += 3;
+
+    // Ce qu'il faut taper.
+    if let Some(p) = parry {
+        let spans: Vec<Span> = p
+            .word
+            .chars()
+            .enumerate()
+            .map(|(i, c)| {
+                let style = match i.cmp(&p.pos) {
+                    std::cmp::Ordering::Less => bold(GOOD),
+                    std::cmp::Ordering::Equal => bold(white).bg(DANGER),
+                    std::cmp::Ordering::Greater => bold(BAD),
+                };
+                Span::styled(format!(" {c} "), style)
+            })
+            .collect();
+        center(buf, area, y + 1, Line::from(spans));
+        let left = p.until.saturating_duration_since(now).as_millis() as u32;
+        let time = gauge(left, p.window.as_millis() as u32, area.width as usize, DANGER);
+        put(buf, area, y + 2, Line::from(time.to_vec()));
+    } else if let Some(m) = mine.filter(|m| m.alive()) {
+        let text = f.text(m);
+        let chars: Vec<char> = text.chars().collect();
+        for (i, (s, e)) in wrap(&chars, area.width as usize).into_iter().enumerate() {
+            let spans: Vec<Span> = text[s..e]
+                .char_indices()
+                .map(|(i, c)| {
+                    let style = match (s + i).cmp(&m.pos) {
+                        std::cmp::Ordering::Less => fg(GOOD),
+                        std::cmp::Ordering::Equal => {
+                            Style::new().fg(INK).bg(if m.wrong { BAD } else { ACCENT })
+                        }
+                        std::cmp::Ordering::Greater => fg(TEXT),
+                    };
+                    Span::styled(c.to_string(), style)
+                })
+                .collect();
+            put(buf, area, y + i as u16, Line::from(spans));
+        }
+    }
+    y += 4;
+
+    // Moi : vie, combo, dernier événement.
+    if let Some(m) = mine {
+        let c = hp_color(m.hp);
+        let hit = m.event.is_some_and(|(e, t)| {
+            !matches!(e, Event::Hit { .. } | Event::Parried)
+                && now.saturating_duration_since(t) < Duration::from_millis(500)
+        });
+        let mut spans = vec![Span::styled("TOI ", bold(if hit { BAD } else { ACCENT }))];
+        spans.extend(gauge(m.hp as u32, boss::MAX_HP as u32, 18, if hit { white } else { c }));
+        spans.push(Span::styled(format!(" {:>3} PV  ", m.hp), bold(c)));
+        let dots = if m.mult() == boss::MAX_MULT { boss::COMBO_STEP } else { m.combo % boss::COMBO_STEP };
+        spans.push(Span::styled(format!("x{} ", m.mult()), bold(Color::Indexed(214))));
+        spans.push(Span::styled("●".repeat(dots as usize), fg(Color::Indexed(214))));
+        spans.push(Span::styled("○".repeat((boss::COMBO_STEP - dots) as usize), fg(HAIRLINE)));
+        put(buf, area, y, Line::from(spans));
+        put(buf, area, y, event_line(m, now).right_aligned());
+    }
+    y += 1;
+    rule(buf, area, y);
+    y += 1;
+
+    // Alliés, sur deux colonnes.
+    let half = area.width / 2;
+    let rows = (area.bottom() - 1).saturating_sub(y) as usize;
+    let allies = f.fighters.iter().filter(|a| a.id != me).take(rows * 2);
+    for (i, a) in allies.enumerate() {
+        let col = Rect { x: area.x + (i % 2) as u16 * half, width: half, ..area };
+        let c = hp_color(a.hp);
+        let mut spans = vec![Span::styled(format!("{:<16} ", a.name), fg(if a.alive() { TEXT } else { DIM }))];
+        if !a.alive() {
+            spans.push(Span::styled("à terre", bold(BAD)));
+        } else {
+            spans.extend(gauge(a.hp as u32, boss::MAX_HP as u32, 8, c));
+            if a.parry.is_some() {
+                spans.push(Span::styled(" !", bold(BAD)));
+            }
+        }
+        put(buf, col, y + (i / 2) as u16, Line::from(spans));
+    }
+    let hint = match (mine, parry) {
+        (Some(_), Some(_)) => "tape le mot rouge !",
+        (Some(m), None) if m.alive() && m.wrong => "mauvaise touche : tape la bonne pour avancer",
+        (Some(m), None) if m.alive() => "chaque mot frappe le boss",
+        _ => "regarde le combat",
+    };
+    footer(buf, area, &[("···", hint)]);
+}
+
+fn event_line(m: &Fighter, now: Instant) -> Line<'static> {
+    let Some((event, at)) = m.event else { return Line::default() };
+    if now.saturating_duration_since(at) > Duration::from_millis(1500) {
+        return Line::default();
+    }
+    match event {
+        Event::Hit { damage, mult } => {
+            let c = [GOOD, GOOD, Color::Indexed(214)][mult as usize - 1];
+            Line::styled(format!("+{damage} dégâts"), bold(c))
+        }
+        Event::Fault => Line::styled(format!("FAUTE -{} PV", boss::FAULT_DAMAGE), bold(BAD)),
+        Event::Parried => Line::styled("PARÉ !", bold(Color::Indexed(81))),
+        Event::Missed => Line::styled(format!("RATÉ -{} PV", boss::MISS_DAMAGE), bold(BAD)),
+        Event::Enraged(n) => Line::styled(format!("ENRAGE -{n} PV"), bold(BAD)),
+        Event::Down => Line::styled("À TERRE", bold(BAD)),
+    }
+}
+
+fn boss_results(buf: &mut Buffer, area: Rect, g: &Game, me: u64, draft: &str, until: Instant, now: Instant) {
+    let Some(f): Option<&Fight> = g.fight.as_ref() else { return };
+    let right = format!("salon dans {}", secs_left(until, now));
+    let y = header(buf, area, boss::NAME, right, DIM) - 1;
+    if f.won == Some(true) {
+        let text = format!("★  VICTOIRE en {}s  ★", f.time.as_secs());
+        banner(buf, area, y, &text, GO, INK);
+    } else {
+        let left = (f.hp as u64 * 100).div_ceil(f.max as u64);
+        let text = format!("DÉFAITE : il lui restait {left}%");
+        banner(buf, area, y, &text, DANGER, Color::Indexed(231));
+    }
+    let mut y = y + 3;
+    let head = format!("  {:<17}{:>8}{:>9}{:>8}{:>6}", "joueur", "dégâts", "parades", "fautes", "PV");
+    put(buf, area, y, Line::styled(head, fg(DIM)));
+    y += 1;
+    let ranking = f.ranking();
+    let rows = list_rows(area, y, ranking.len());
+    let mine = ranking.iter().position(|p| p.id == me).unwrap_or(0);
+    let skip = (mine + 1).saturating_sub(rows);
+    for (i, (rank, p)) in ranking.iter().enumerate().skip(skip).take(rows).enumerate() {
+        let mvp = rank == 0 && p.damage > 0;
+        let line = Line::from(vec![
+            Span::styled(if mvp { "★ " } else { "  " }, bold(Color::Indexed(214))),
+            Span::styled(format!("{:<17}", p.name), if p.id == me { bold(ACCENT) } else { fg(TEXT) }),
+            Span::styled(format!("{:>8}", p.damage), bold(GOOD)),
+            Span::styled(format!("{:>9}", p.parries), fg(Color::Indexed(81))),
+            Span::styled(format!("{:>8}", p.errors), fg(WARN)),
+            Span::styled(format!("{:>6}", p.hp), bold(hp_color(p.hp))),
+        ]);
+        put(buf, area, y + i as u16, line);
+    }
+    chat(buf, area, y + rows as u16, g, draft, now);
+    footer(buf, area, &[("Entrée", "envoyer")]);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -649,7 +924,7 @@ mod tests {
         let mut g = Game::new();
         for i in 0..30 {
             g.join(i, "ada", Stats::default(), now);
-            g.toggle_vote(i);
+            g.cycle_vote(i, true);
         }
         for id in 0..30 {
             g.say(id, &"é".repeat(120), now);
@@ -669,6 +944,31 @@ mod tests {
                     stats.finished(wpm, 100);
                 }
                 draw(&mut buf, View::Game(&g, 29, "", Some(&Panel { name: "x".into(), stats: None })), t);
+            }
+        }
+    }
+
+    #[test]
+    fn boss_draws_at_any_size() {
+        for n in [1, 30] {
+            let now = Instant::now();
+            let mut g = Game::new();
+            for i in 0..n {
+                g.join(i, "abcdefghijklmnop", Stats::default(), now);
+                g.cycle_vote(i, false);
+            }
+            g.press_enter(0, now);
+            let mut t = now;
+            for step in [3, 7, 7, 7, 2, 2, 4, 30, 30, 30, 30, 30] {
+                t += Duration::from_secs(step);
+                g.tick(t);
+                g.key(0, 'e', t);
+                for (w, h) in [(60, 18), (80, 24), (300, 100)] {
+                    for me in [0, 99] {
+                        let mut buf = Buffer::empty(Rect::new(0, 0, w, h));
+                        draw(&mut buf, View::Game(&g, me, "", None), t);
+                    }
+                }
             }
         }
     }

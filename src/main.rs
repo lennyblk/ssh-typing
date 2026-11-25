@@ -1,4 +1,5 @@
 mod accounts;
+mod boss;
 mod game;
 mod input;
 mod phrases;
