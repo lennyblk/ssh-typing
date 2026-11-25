@@ -20,7 +20,7 @@ const TRACK: Color = Color::Indexed(237);
 const KEY_BG: Color = Color::Indexed(238);
 const TEXT: Color = Color::Indexed(252);
 const GOOD: Color = Color::Indexed(114);
-const MODE_SOLO: Color = Color::Indexed(220);
+const MODE_SOLO: Color = Color::Indexed(186);
 const MODE_TEAMS: Color = Color::Indexed(177);
 const BAD: Color = Color::Indexed(203);
 
