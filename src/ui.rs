@@ -20,6 +20,8 @@ const TRACK: Color = Color::Indexed(237);
 const KEY_BG: Color = Color::Indexed(238);
 const TEXT: Color = Color::Indexed(252);
 const GOOD: Color = Color::Indexed(114);
+const MODE_SOLO: Color = Color::Indexed(220);
+const MODE_TEAMS: Color = Color::Indexed(177);
 const BAD: Color = Color::Indexed(203);
 
 /// Une couleur par personne dans le chat, les plus contrastées d'abord.
@@ -374,6 +376,40 @@ fn chat(buf: &mut Buffer, area: Rect, y: u16, g: &Game, draft: &str, now: Instan
     put(buf, area, input, line);
 }
 
+/// Les deux modes côte à côte : celui qui l'emporte est plein, l'autre éteint.
+fn mode_cards(buf: &mut Buffer, area: Rect, g: &Game, me: u64) {
+    let (solo, teams) = g.votes();
+    let mine = g.player(me).map(|p| p.vote);
+    let half = area.width / 2;
+    let cards = [
+        (Mode::Solo, "INDIVIDUEL", solo, MODE_SOLO, 0),
+        (Mode::Teams, "ÉQUIPES", teams, MODE_TEAMS, half),
+    ];
+    for (mode, label, votes, color, dx) in cards {
+        let rect = Rect { x: area.x + dx, width: half, ..area };
+        let leads = g.next_mode() == mode;
+        let border = if leads { BorderType::Thick } else { BorderType::Rounded };
+        let mut block = Block::bordered()
+            .border_type(border)
+            .border_style(fg(if leads { color } else { HAIRLINE }));
+        if leads {
+            block = block.title_top(Line::styled(" prochain mode ", bold(color)).centered());
+        }
+        if mine == Some(mode) {
+            block = block.title_bottom(Line::styled(" ▲ ton vote ", bold(color)).centered());
+        }
+        let inner = block.inner(rect);
+        block.render(rect, buf);
+        let s = if votes > 1 { "s" } else { "" };
+        let style = if leads { Style::new().fg(Color::Indexed(234)).bg(color) } else { fg(color) };
+        if leads {
+            buf.set_style(inner, style);
+        }
+        let text = format!("{label}  ·  {votes} vote{s}");
+        center(buf, inner, inner.y, Line::styled(text, style.add_modifier(Modifier::BOLD)));
+    }
+}
+
 fn lobby(
     buf: &mut Buffer,
     area: Rect,
@@ -383,24 +419,12 @@ fn lobby(
     start: Option<Instant>,
     now: Instant,
 ) {
-    let mut y = logo(buf, area);
+    // Petit terminal : le choix du mode passe avant le logo.
+    let mut y = if area.height >= 22 { logo(buf, area) - 1 } else { area.y };
+    mode_cards(buf, Rect { y, height: 3, ..area }, g, me);
+    y += 3;
     let ready = g.player(me).is_some_and(|p| p.ready);
     let alone = g.players.iter().filter(|p| p.ready).count() == 1 && ready;
-    let (solo, teams) = g.votes();
-    let (mode, c) = match g.next_mode() {
-        Mode::Solo => ("individuel", TEXT),
-        Mode::Teams => ("équipes", team_color(Team::Falco)),
-    };
-    let vote = match g.player(me).map(|p| p.vote) {
-        Some(Mode::Teams) => "équipes",
-        _ => "individuel",
-    };
-    let line = Line::from(vec![
-        Span::styled("Mode ", fg(DIM)),
-        Span::styled(mode, bold(c)),
-        Span::styled(format!(" ({solo} contre {teams}) · ton vote : {vote}"), fg(DIM)),
-    ]);
-    center(buf, area, y - 1, line);
     let status = match start {
         Some(t) => Line::styled(format!("Départ dans {}", secs_left(t, now)), bold(GOOD)),
         None => Line::styled("En attente d'un adversaire...", fg(DIM)),
@@ -448,7 +472,7 @@ fn lobby(
         (_, true) => "pas prêt",
         (_, false) => "prêt",
     };
-    footer(buf, area, &[("Entrée", label), ("Tab", "mode"), ("Ctrl+P", "profil")]);
+    footer(buf, area, &[("Entrée", label), ("← →", "mode"), ("Ctrl+P", "profil")]);
 }
 
 /// Coupe le texte sur les espaces ; renvoie des intervalles [début, fin).

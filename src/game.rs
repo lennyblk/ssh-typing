@@ -257,6 +257,16 @@ impl Game {
         }
     }
 
+    /// Flèche gauche ou droite : mode dans le salon, camp ailleurs.
+    pub fn arrow(&mut self, id: u64, right: bool, now: Instant) {
+        if !matches!(self.phase, Phase::Lobby { .. }) {
+            return self.choose(id, if right { Team::Falco } else { Team::Fox }, now);
+        }
+        if let Some(p) = self.players.iter_mut().find(|p| p.id == id) {
+            p.vote = if right { Mode::Teams } else { Mode::Solo };
+        }
+    }
+
     /// Votes des joueurs prêts : (chacun pour soi, équipes).
     pub fn votes(&self) -> (usize, usize) {
         let ready = self.players.iter().filter(|p| p.ready);
@@ -834,6 +844,18 @@ mod tests {
         g.tick(t);
         assert!(matches!(g.phase, Phase::Results { .. }));
         t
+    }
+
+    #[test]
+    fn arrows_vote_in_lobby() {
+        let t = Instant::now();
+        let mut g = Game::new();
+        g.join(1, "p", Stats::default(), t);
+        g.arrow(1, true, t);
+        assert_eq!(g.votes(), (0, 1));
+        g.arrow(1, false, t);
+        assert_eq!(g.votes(), (1, 0));
+        assert!(g.player(1).unwrap().team.is_none());
     }
 
     #[test]

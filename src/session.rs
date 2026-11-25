@@ -14,7 +14,7 @@ use russh::{ChannelMsg, ChannelReadHalf, ChannelWriteHalf, server::Msg};
 use tokio::time::{MissedTickBehavior, interval, timeout};
 
 use crate::{
-    game::{MAX_MESSAGE, MAX_NAME, Phase, Team, chat_char, clean_name},
+    game::{MAX_MESSAGE, MAX_NAME, Phase, chat_char, clean_name},
     input::{Key, Parser},
     ui::{self, Panel, View},
     world::World,
@@ -184,8 +184,8 @@ async fn play(
                             }
                             (_, None) => {}
                             (Key::Tab, Some(_)) => lock(&game).game.toggle_vote(id),
-                            (Key::Left, Some(_)) => lock(&game).game.choose(id, Team::Fox, Instant::now()),
-                            (Key::Right, Some(_)) => lock(&game).game.choose(id, Team::Falco, Instant::now()),
+                            (Key::Left, Some(_)) => lock(&game).game.arrow(id, false, Instant::now()),
+                            (Key::Right, Some(_)) => lock(&game).game.arrow(id, true, Instant::now()),
                             (Key::Profile, Some(_)) => {
                                 panel = match panel {
                                     Some(_) => None,
