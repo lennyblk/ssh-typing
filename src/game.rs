@@ -537,9 +537,26 @@ impl Game {
         }
     }
 
+    /// Chat ouvert pour ce joueur : en course, dès qu'il a fini (ou s'il regarde).
+    pub fn chat_open_for(&self, id: u64, now: Instant) -> bool {
+        let run = self.player(id).and_then(|p| p.run.as_ref());
+        // Un instant après l'arrivée : les dernières frappes ne tombent pas dans le chat.
+        let done = |start: Instant| {
+            run.and_then(|r| r.finish).is_some_and(|f| now.saturating_duration_since(start) >= f + CHAT_REOPEN)
+        };
+        match self.phase {
+            Phase::Racing { start, .. } => run.is_none() || done(start),
+            Phase::Results { until } if run.is_some_and(|r| r.finish.is_some()) => {
+                // Entre deux manches, la suivante démarre sans repasser par le salon.
+                !self.match_on() || until.saturating_duration_since(now) > CHAT_LOCK
+            }
+            _ => self.chat_open(now),
+        }
+    }
+
     /// Publie un message. Faux si le chat est fermé ou le joueur trop bavard.
     pub fn say(&mut self, id: u64, text: &str, now: Instant) -> bool {
-        if !self.chat_open(now) {
+        if !self.chat_open_for(id, now) {
             return false;
         }
         let Some(p) = self.players.iter_mut().find(|p| p.id == id) else { return false };
@@ -1223,5 +1240,23 @@ mod tests {
         g.restart(1, t);
         g.join(2, "b", Stats::default(), t + secs(1));
         assert_eq!(g.phase, Phase::Lobby { start_at: Some(t + secs(1) + JOIN_GRACE) });
+    }
+
+    #[test]
+    fn finished_racers_and_spectators_can_chat_during_race() {
+        let (mut g, t) = racing();
+        g.join(3, "eve", Stats::default(), t);
+        assert!(!g.chat_open_for(1, t) && g.chat_open_for(3, t));
+        let done = type_all(&mut g, 1, t);
+        assert!(!g.chat_open_for(1, done));
+        assert!(!g.say(1, "trop tard", done));
+        let later = done + secs(2);
+        assert!(g.say(1, "trop lent bob", later));
+        assert!(!g.say(2, "tg", later));
+        assert!(g.say(3, "go bob", later));
+        g.tick(later + AFTER_FIRST);
+        assert!(matches!(g.phase, Phase::Results { .. }));
+        assert!(g.chat_open_for(1, later + AFTER_FIRST));
+        assert!(!g.chat_open_for(2, later + AFTER_FIRST));
     }
 }

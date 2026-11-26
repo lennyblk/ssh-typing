@@ -226,7 +226,7 @@ async fn play(
                             (Key::Char(c), Some(_)) => {
                                 let now = Instant::now();
                                 let g = &mut lock(&game).game;
-                                if !g.chat_open(now) {
+                                if !g.chat_open_for(id, now) {
                                     g.key(id, c, now);
                                 } else if chat_char(c) && draft.chars().count() < MAX_MESSAGE {
                                     panel = None;
@@ -234,7 +234,7 @@ async fn play(
                                 }
                             }
                             (Key::Backspace, Some(_)) => {
-                                if lock(&game).game.chat_open(Instant::now()) {
+                                if lock(&game).game.chat_open_for(id, Instant::now()) {
                                     draft.pop();
                                 }
                             }

@@ -96,7 +96,7 @@ pub fn draw(buf: &mut Buffer, view: View, now: Instant) {
         View::Game(g, me, draft, None) => match g.phase {
             Phase::Lobby { start_at } => lobby(buf, area, g, me, draft, start_at, now),
             Phase::Picking { until, last } => picking(buf, area, g, me, draft, until, last, now),
-            Phase::Racing { start, ends } => race(buf, area, g, me, start, ends, now),
+            Phase::Racing { start, ends } => race(buf, area, g, me, draft, start, ends, now),
             Phase::Briefing { until } => briefing(buf, area, until, now),
             Phase::Boss => boss_fight(buf, area, g, me, now),
             Phase::Results { until } if g.mode == Mode::Boss => {
@@ -240,7 +240,7 @@ fn picking(
             center(buf, inner, inner.y + row as u16, Line::styled(p.name.clone(), style));
         }
     }
-    chat(buf, area, y + height, g, draft, now);
+    chat(buf, area, y + height, g, me, draft, now);
     footer(buf, area, &[("←", "Fox"), ("→", "Falco")]);
 }
 
@@ -358,7 +358,7 @@ fn list_rows(area: Rect, y: u16, wanted: usize) -> usize {
     wanted.min(avail.saturating_sub(chat))
 }
 
-fn chat(buf: &mut Buffer, area: Rect, y: u16, g: &Game, draft: &str, now: Instant) {
+fn chat(buf: &mut Buffer, area: Rect, y: u16, g: &Game, me: u64, draft: &str, now: Instant) {
     rule(buf, area, y);
     let input = area.bottom() - 2;
     let width = area.width as usize;
@@ -382,7 +382,10 @@ fn chat(buf: &mut Buffer, area: Rect, y: u16, g: &Game, draft: &str, now: Instan
         put(buf, area, y + 1 + i as u16, l);
     }
 
-    let line = if !g.chat_open(now) {
+    let racing = matches!(g.phase, Phase::Racing { .. });
+    let line = if !g.chat_open_for(me, now) && racing {
+        Line::styled("> finis ta phrase pour écrire", fg(DIM))
+    } else if !g.chat_open_for(me, now) {
         Line::styled("> chat fermé : mains sur le clavier", fg(DIM))
     } else if draft.is_empty() {
         Line::from(vec![
@@ -494,7 +497,7 @@ fn lobby(
         ]);
         put(buf, right, y + i as u16, line);
     }
-    chat(buf, area, y + rows as u16, g, draft, now);
+    chat(buf, area, y + rows as u16, g, me, draft, now);
     let label = match (alone && start.is_none(), ready) {
         _ if !draft.trim().is_empty() => "envoyer",
         (true, _) => "jouer seul",
@@ -516,7 +519,17 @@ pub fn wrap(b: &[char], width: usize) -> Vec<(usize, usize)> {
     out
 }
 
-fn race(buf: &mut Buffer, area: Rect, g: &Game, me: u64, start: Instant, ends: Instant, now: Instant) {
+#[allow(clippy::too_many_arguments)]
+fn race(
+    buf: &mut Buffer,
+    area: Rect,
+    g: &Game,
+    me: u64,
+    draft: &str,
+    start: Instant,
+    ends: Instant,
+    now: Instant,
+) {
     let left = secs_left(ends, now);
     let ranking = g.ranking();
     let title = match g.mode {
@@ -560,7 +573,7 @@ fn race(buf: &mut Buffer, area: Rect, g: &Game, me: u64, start: Instant, ends: I
         team_line(buf, area, y, g, elapsed);
         y += 1;
     }
-    let rows = (area.bottom() - 1).saturating_sub(y) as usize;
+    let rows = list_rows(area, y, ranking.len());
     for (i, (rank, p)) in window(&ranking, me, rows).into_iter().enumerate() {
         let r = p.run.as_ref().unwrap();
         let bar = (area.width as usize).saturating_sub(32);
@@ -579,10 +592,11 @@ fn race(buf: &mut Buffer, area: Rect, g: &Game, me: u64, start: Instant, ends: I
         ]);
         put(buf, area, y + i as u16, line);
     }
+    chat(buf, area, y + rows as u16, g, me, draft, now);
     let hint = match mine {
         None if g.mode == Mode::Teams => "spectateur : ← → pour un camp à la fin de la phrase",
         None => "spectateur : tu cours à la prochaine",
-        Some(r) if r.finish.is_some() => "arrivé ! attente des autres",
+        Some(r) if r.finish.is_some() => "arrivé ! chambre les autres dans le chat",
         Some(r) if r.wrong => "mauvaise touche : tape la bonne pour avancer",
         Some(_) => "tape le texte",
     };
@@ -649,7 +663,7 @@ fn results(
         ]);
         put(buf, area, y + i as u16, line);
     }
-    chat(buf, area, y + rows as u16, g, draft, now);
+    chat(buf, area, y + rows as u16, g, me, draft, now);
     if next && g.player(me).is_some_and(|p| p.team.is_none()) {
         footer(buf, area, &[("←", "Fox"), ("→", "Falco")]);
     } else {
@@ -913,7 +927,7 @@ fn boss_results(buf: &mut Buffer, area: Rect, g: &Game, me: u64, draft: &str, un
         ]);
         put(buf, area, y + i as u16, line);
     }
-    chat(buf, area, y + rows as u16, g, draft, now);
+    chat(buf, area, y + rows as u16, g, me, draft, now);
     results_footer(buf, area, g);
 }
 
